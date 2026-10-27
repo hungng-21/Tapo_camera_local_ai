@@ -1,0 +1,20 @@
+{
+  "domain": "tapo_local_ai",
+  "name": "Tapo Camera Local AI",
+  "codeowners": [
+    "@tapo-local-ai"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "ffmpeg",
+    "stream"
+  ],
+  "documentation": "https://github.com/JurajNyiri/HomeAssistant-Tapo-Control",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/JurajNyiri/pytapo/issues",
+  "requirements": [
+    "pytapo>=3.3.54",
+    "onvif-zeep-async"
+  ],
+  "version": "1.2.3"
+}
