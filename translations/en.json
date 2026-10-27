@@ -1,0 +1,68 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Tapo Camera Local AI",
+        "description": "Enter the camera local IP address and Camera Account credentials (configured in Tapo App -> Camera Settings -> Advanced Settings -> Camera Account).",
+        "data": {
+          "host": "Camera IP Address (Host)",
+          "username": "Camera Account Username",
+          "password": "Camera Account Password",
+          "cloud_password": "TP-Link Cloud Password (Optional for newer FW)",
+          "control_port": "Control Port (Default: 443)",
+          "onvif_port": "ONVIF Event Port (Default: 2020)",
+          "rtsp_port": "RTSP Stream Port (Default: 554)",
+          "poll_interval": "Local AI Event Poll Interval (seconds)",
+          "hold_seconds": "Binary Sensor Hold Time (seconds)",
+          "enable_onvif": "Enable Real-time ONVIF PullPoint Subscription"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Tapo Camera Local AI",
+        "description": "Update camera IP, credentials, or local AI polling parameters.",
+        "data": {
+          "host": "Camera IP Address (Host)",
+          "username": "Camera Account Username",
+          "password": "Camera Account Password",
+          "cloud_password": "TP-Link Cloud Password (Optional for newer FW)",
+          "control_port": "Control Port (Default: 443)",
+          "onvif_port": "ONVIF Event Port (Default: 2020)",
+          "rtsp_port": "RTSP Stream Port (Default: 554)",
+          "poll_interval": "Local AI Event Poll Interval (seconds)",
+          "hold_seconds": "Binary Sensor Hold Time (seconds)",
+          "enable_onvif": "Enable Real-time ONVIF PullPoint Subscription"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the Tapo camera. Check IP, Camera Account credentials, and Cloud Password."
+    },
+    "abort": {
+      "already_configured": "This camera is already configured.",
+      "reconfigure_successful": "Reconfiguration was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Tapo Camera Local AI Options",
+        "description": "Modify camera connection credentials or local AI event polling intervals.",
+        "data": {
+          "host": "Camera IP Address (Host)",
+          "username": "Camera Account Username",
+          "password": "Camera Account Password",
+          "cloud_password": "TP-Link Cloud Password (Optional for newer FW)",
+          "control_port": "Control Port (Default: 443)",
+          "onvif_port": "ONVIF Event Port (Default: 2020)",
+          "rtsp_port": "RTSP Stream Port (Default: 554)",
+          "poll_interval": "Local AI Event Poll Interval (seconds)",
+          "hold_seconds": "Binary Sensor Hold Time (seconds)",
+          "enable_onvif": "Enable Real-time ONVIF PullPoint Subscription"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the Tapo camera with the updated settings."
+    }
+  }
+}
