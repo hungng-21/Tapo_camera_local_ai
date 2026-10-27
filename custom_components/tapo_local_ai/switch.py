@@ -1,4 +1,4 @@
-"""Switch platform to toggle Tapo Camera AI detections (Baby Cry, Bark, Person, Privacy, LED, etc.)."""
+"""Switch platform to toggle Tapo Camera AI detections, Image Processing (Flip, LDC), Recording, Mic Mute, and Alarm."""
 from __future__ import annotations
 
 from typing import Any
@@ -19,7 +19,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Tapo AI configuration switches supported by the camera."""
+    """Set up Tapo AI configuration and hardware switches supported by the camera."""
     coordinator: TapoLocalAICoordinator = hass.data[DOMAIN][entry.entry_id]
 
     entities = [
@@ -31,7 +31,7 @@ async def async_setup_entry(
 
 
 class TapoAIDetectionSwitch(CoordinatorEntity[TapoLocalAICoordinator], SwitchEntity):
-    """Switch entity to enable/disable on-device AI detections and controls on Tapo camera."""
+    """Switch entity to enable/disable on-device AI detections, image flip, LDC, SD recording, and mic mute."""
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
@@ -45,21 +45,22 @@ class TapoAIDetectionSwitch(CoordinatorEntity[TapoLocalAICoordinator], SwitchEnt
         super().__init__(coordinator)
         self.spec = spec
         self._attr_unique_id = f"{coordinator.serial_number}_{spec.key}"
+        self._attr_translation_key = spec.key
         self._attr_name = spec.name_vi
         self._attr_icon = spec.icon
         self._attr_device_info = coordinator.device_info
 
     @property
     def is_on(self) -> bool:
-        """Return True if the AI detection setting is enabled on the camera."""
+        """Return True if the switch setting is enabled on the camera."""
         if not self.coordinator.data:
             return False
         return bool(self.coordinator.data.get("switches", {}).get(self.spec.key, False))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Enable this AI detection on the camera."""
+        """Enable this setting on the camera."""
         await self.coordinator.async_set_ai_switch(self.spec, True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Disable this AI detection on the camera."""
+        """Disable this setting on the camera."""
         await self.coordinator.async_set_ai_switch(self.spec, False)

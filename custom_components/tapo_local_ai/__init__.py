@@ -7,6 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
 from .coordinator import TapoLocalAICoordinator
@@ -20,7 +21,36 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.SELECT,
     Platform.NUMBER,
+    Platform.SIREN,
 ]
+
+# Obsolete unique_id suffixes from earlier test builds to auto-remove from Entity Registry
+OBSOLETE_NUMBER_SUFFIXES = (
+    "_baby_cry_sensitivity",
+    "_bark_sensitivity",
+    "_meow_sensitivity",
+    "_glass_break_sensitivity",
+    "_tamper_sensitivity",
+    "_siren_volume",
+)
+OBSOLETE_SELECT_SUFFIXES = (
+    "_motion_sensitivity_level",
+    "_baby_cry_sensitivity_level",
+    "_tamper_sensitivity_level",
+)
+
+
+def _async_cleanup_obsolete_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove redundant sensitivity entities from the entity registry automatically."""
+    ent_reg = er.async_get(hass)
+    for ent_entry in list(er.async_entries_for_config_entry(ent_reg, entry.entry_id)):
+        uid = ent_entry.unique_id or ""
+        if ent_entry.domain == "number" and uid.endswith(OBSOLETE_NUMBER_SUFFIXES):
+            _LOGGER.info("Tự động dọn thực thể dư thừa: %s", ent_entry.entity_id)
+            ent_reg.async_remove(ent_entry.entity_id)
+        elif ent_entry.domain == "select" and uid.endswith(OBSOLETE_SELECT_SUFFIXES):
+            _LOGGER.info("Tự động dọn thực thể dư thừa: %s", ent_entry.entity_id)
+            ent_reg.async_remove(ent_entry.entity_id)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -37,6 +67,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from err
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    _async_cleanup_obsolete_entities(hass, entry)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
