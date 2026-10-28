@@ -2,18 +2,18 @@
   "config": {
     "step": {
       "user": {
-        "title": "Kết nối Camera Tapo Local AI",
-        "description": "Nhập địa chỉ IP nội bộ và tài khoản Camera Account (cài đặt trong ứng dụng Tapo: Cài đặt nâng cao -> Tài khoản Camera). Nếu dùng firmware mới (KLAP/TPAP), nhập thêm mật khẩu tài khoản TP-Link Cloud.",
+        "title": "Kết nối Camera Tapo Local AI (Ultimate v2.0)",
+        "description": "Nhập địa chỉ IP nội bộ và tài khoản Camera Account (cài đặt trong ứng dụng Tapo: Cài đặt nâng cao -> Tài khoản Camera). Với firmware mới (KLAP/TPAP) hoặc Tapo C260 Nhận diện khuôn mặt, nhập thêm mật khẩu tài khoản TP-Link Cloud.",
         "data": {
           "host": "Địa chỉ IP Camera (Host)",
           "username": "Tài khoản Camera (Camera Account Username)",
           "password": "Mật khẩu Camera (Camera Account Password)",
-          "cloud_password": "Mật khẩu TP-Link Cloud (Tùy chọn cho FW mới)",
+          "cloud_password": "Mật khẩu TP-Link Cloud (Dùng cho FW mới & C260 Face AI)",
           "control_port": "Cổng điều khiển HTTPS/KLAP (Mặc định: 443)",
           "onvif_port": "Cổng sự kiện ONVIF (Mặc định: 2020)",
           "rtsp_port": "Cổng luồng video RTSP (Mặc định: 554)",
-          "poll_interval": "Chu kỳ quét sự kiện AI Local (giây)",
-          "hold_seconds": "Thời gian giữ trạng thái ON cho Binary Sensor (giây)",
+          "poll_interval": "Chu kỳ quét sự kiện AI & Khuôn mặt Local (giây)",
+          "hold_seconds": "Thời gian giữ trạng thái ON cho Binary Sensor AI (giây)",
           "enable_onvif": "Bật luồng sự kiện đẩy ONVIF PullPoint (Real-time)"
         }
       },
@@ -24,45 +24,143 @@
           "host": "Địa chỉ IP Camera (Host)",
           "username": "Tài khoản Camera (Camera Account Username)",
           "password": "Mật khẩu Camera (Camera Account Password)",
-          "cloud_password": "Mật khẩu TP-Link Cloud (Tùy chọn cho FW mới)",
+          "cloud_password": "Mật khẩu TP-Link Cloud (Dùng cho FW mới & C260 Face AI)",
           "control_port": "Cổng điều khiển HTTPS/KLAP (Mặc định: 443)",
           "onvif_port": "Cổng sự kiện ONVIF (Mặc định: 2020)",
           "rtsp_port": "Cổng luồng video RTSP (Mặc định: 554)",
-          "poll_interval": "Chu kỳ quét sự kiện AI Local (giây)",
-          "hold_seconds": "Thời gian giữ trạng thái ON cho Binary Sensor (giây)",
+          "poll_interval": "Chu kỳ quét sự kiện AI & Khuôn mặt Local (giây)",
+          "hold_seconds": "Thời gian giữ trạng thái ON cho Binary Sensor AI (giây)",
           "enable_onvif": "Bật luồng sự kiện đẩy ONVIF PullPoint (Real-time)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Xác thực lại Camera Tapo ({host})",
+        "description": "Camera tại {host} từ chối đăng nhập. Vui lòng kiểm tra lại tài khoản Camera Account và mật khẩu TP-Link Cloud.",
+        "data": {
+          "username": "Tài khoản Camera (Camera Account Username)",
+          "password": "Mật khẩu Camera (Camera Account Password)",
+          "cloud_password": "Mật khẩu TP-Link Cloud"
         }
       }
     },
     "error": {
-      "cannot_connect": "Không thể kết nối tới Camera. Hãy kiểm tra IP, tài khoản Camera Account và mật khẩu Cloud."
+      "cannot_connect": "Không thể kết nối tới Camera. Hãy kiểm tra IP, tài khoản Camera Account và mật khẩu Cloud.",
+      "authentication_failed": "Xác thực thất bại. Vui lòng kiểm tra lại mật khẩu Camera và mật khẩu TP-Link Cloud."
     },
     "abort": {
       "already_configured": "Camera này đã được cấu hình trong Home Assistant.",
-      "reconfigure_successful": "Đã cập nhật cấu hình camera thành công."
+      "reconfigure_successful": "Đã cập nhật cấu hình camera thành công.",
+      "reauth_successful": "Đã cập nhật thông tin đăng nhập thành công.",
+      "no_faces": "Chưa có Face ID người quen nào được khai báo.",
+      "no_unknown_faces": "Chưa phát hiện Face ID người lạ nào."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Cấu hình Camera Tapo Local AI",
-        "description": "Chỉnh sửa thông tin kết nối hoặc thời gian quét sự kiện AI cho camera.",
+        "title": "Quản lý Camera Tapo Local AI & Khuôn mặt",
+        "menu_options": {
+          "connection": "Cấu hình kết nối Camera, Cổng & ONVIF",
+          "faces": "Xem danh sách Face ID người quen",
+          "unknown_faces": "Xem danh sách Face ID lạ đã phát hiện",
+          "add_face": "Thêm Face ID người quen mới",
+          "add_unknown": "Đặt tên người quen từ danh sách Face ID lạ",
+          "edit_face": "Sửa Face ID / Tên người quen",
+          "delete_face": "Xóa Face ID người quen",
+          "polling": "Chu kỳ quét (Polling) & Chống lặp (Dedup)",
+          "retention": "Giới hạn lưu trữ lịch sử & người lạ",
+          "sidebar": "Hiển thị bảng Tapo Face Manager ở thanh bên"
+        }
+      },
+      "connection": {
+        "title": "Cấu hình kết nối Camera, Cổng & ONVIF",
+        "description": "Chỉnh sửa thông tin kết nối, cổng dịch vụ hoặc bật/tắt luồng sự kiện ONVIF.",
         "data": {
           "host": "Địa chỉ IP Camera (Host)",
           "username": "Tài khoản Camera (Camera Account Username)",
           "password": "Mật khẩu Camera (Camera Account Password)",
-          "cloud_password": "Mật khẩu TP-Link Cloud (Tùy chọn cho FW mới)",
+          "cloud_password": "Mật khẩu TP-Link Cloud (Dùng cho FW mới & C260 Face AI)",
           "control_port": "Cổng điều khiển HTTPS/KLAP (Mặc định: 443)",
           "onvif_port": "Cổng sự kiện ONVIF (Mặc định: 2020)",
           "rtsp_port": "Cổng luồng video RTSP (Mặc định: 554)",
-          "poll_interval": "Chu kỳ quét sự kiện AI Local (giây)",
-          "hold_seconds": "Thời gian giữ trạng thái ON cho Binary Sensor (giây)",
+          "poll_interval": "Chu kỳ quét sự kiện AI & Khuôn mặt Local (giây)",
+          "hold_seconds": "Thời gian giữ trạng thái ON cho Binary Sensor AI (giây)",
           "enable_onvif": "Bật luồng sự kiện đẩy ONVIF PullPoint (Real-time)"
+        }
+      },
+      "faces": {
+        "title": "Danh sách Face ID người quen đã khai báo",
+        "description": "{faces}"
+      },
+      "unknown_faces": {
+        "title": "Danh sách Face ID lạ đã phát hiện",
+        "description": "{unknown_faces}"
+      },
+      "add_face": {
+        "title": "Thêm Face ID người quen",
+        "description": "Nhập mã số Face ID mà camera đã phát hiện và tên người tương ứng.",
+        "data": {
+          "face_id": "Mã Face ID (chỉ gồm chữ số)",
+          "name": "Tên người quen"
+        }
+      },
+      "add_unknown": {
+        "title": "Đặt tên người quen từ Face ID lạ",
+        "description": "Chọn một mã Face ID mà camera đã phát hiện, sau đó đặt tên.",
+        "data": {
+          "face_id": "Mã Face ID",
+          "name": "Tên người quen"
+        }
+      },
+      "edit_face": {
+        "title": "Sửa Face ID / Tên người quen",
+        "description": "Chọn người quen hiện tại rồi nhập mã Face ID hoặc tên mới.",
+        "data": {
+          "old_face_id": "Face ID hiện tại",
+          "new_face_id": "Face ID mới",
+          "name": "Tên người quen"
+        }
+      },
+      "delete_face": {
+        "title": "Xóa Face ID người quen",
+        "description": "Chọn mã Face ID muốn xóa khỏi danh sách người quen.",
+        "data": {
+          "face_id": "Mã Face ID"
+        }
+      },
+      "polling": {
+        "title": "Chu kỳ quét & Chống lặp (Polling / Dedup)",
+        "description": "Điều chỉnh tần suất đọc sự kiện từ camera, thời gian giữ trạng thái cảm biến và thời gian chống lặp thông báo người quen.",
+        "data": {
+          "poll_interval": "Chu kỳ quét sự kiện (giây)",
+          "hold_seconds": "Thời gian giữ ON cho cảm biến AI (giây)",
+          "history_seconds": "Cửa sổ lịch sử sự kiện mỗi lần quét (giây)",
+          "dedup_seconds": "Thời gian chống lặp cùng 1 người quen (giây)",
+          "stranger_clear_seconds": "Tự tắt cảm biến \"Phát hiện người lạ\" sau (giây)"
+        }
+      },
+      "retention": {
+        "title": "Giới hạn lưu trữ lịch sử & người lạ",
+        "description": "Thống kê và người lạ cũ hơn số ngày này sẽ tự động được dọn dẹp; danh sách người lạ giữ tối đa số lượng bên dưới.",
+        "data": {
+          "retention_days": "Số ngày lưu thống kê / người lạ (1–365)",
+          "max_unknown_faces": "Số người lạ tối đa lưu trữ (10–1000)"
+        }
+      },
+      "sidebar": {
+        "title": "Bảng điều khiển Tapo Face Manager trên Sidebar",
+        "description": "Bật hoặc tắt mục Tapo Face Manager trên thanh bên của Home Assistant. Khi ẩn, bạn vẫn có thể truy cập trực tiếp tại [/tapo_local_ai](/tapo_local_ai).",
+        "data": {
+          "show_sidebar": "Hiển thị trên thanh bên (Sidebar)",
+          "sidebar_title": "Tên hiển thị trên thanh bên"
         }
       }
     },
     "error": {
-      "cannot_connect": "Không thể kết nối tới Camera với thông tin vừa nhập."
+      "cannot_connect": "Không thể kết nối tới Camera với thông tin vừa nhập.",
+      "invalid_face_id": "Mã Face ID phải là chuỗi chữ số.",
+      "invalid_name": "Tên không được để trống.",
+      "face_id_exists": "Mã Face ID này đã tồn tại trong danh sách người quen."
     }
   }
 }

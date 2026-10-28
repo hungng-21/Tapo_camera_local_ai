@@ -1,10 +1,11 @@
-"""Constants for the Tapo Camera Local AI integration."""
+"""Constants for the Tapo Camera Local AI integration (v2.0.0 Ultimate Edition)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 
 DOMAIN = "tapo_local_ai"
+MANUFACTURER = "TP-Link Tapo"
 
 CONF_CLOUD_PASSWORD = "cloud_password"
 CONF_CONTROL_PORT = "control_port"
@@ -13,6 +14,16 @@ CONF_RTSP_PORT = "rtsp_port"
 CONF_POLL_INTERVAL = "poll_interval"
 CONF_HOLD_SECONDS = "hold_seconds"
 CONF_ENABLE_ONVIF = "enable_onvif"
+
+# Face Recognition & Face Manager Dashboard options
+CONF_HISTORY_SECONDS = "history_seconds"
+CONF_DEDUP_SECONDS = "dedup_seconds"
+CONF_FACES = "faces"
+CONF_SHOW_SIDEBAR = "show_sidebar"
+CONF_SIDEBAR_TITLE = "sidebar_title"
+CONF_RETENTION_DAYS = "retention_days"
+CONF_STRANGER_CLEAR_SECONDS = "stranger_clear_seconds"
+CONF_MAX_UNKNOWN_FACES = "max_unknown_faces"
 
 DEFAULT_CONTROL_PORT = 443
 DEFAULT_ONVIF_PORT = 2020
@@ -26,9 +37,43 @@ DEFAULT_SIREN_VOLUME = 8
 DEFAULT_SPEAKER_VOLUME = 100
 DEFAULT_MICROPHONE_VOLUME = 100
 
+# Face Recognition defaults & bounds
+DEFAULT_HISTORY_SECONDS = 120
+DEFAULT_DEDUP_SECONDS = 60
+DEFAULT_FACE_NAME = "Stranger"
+DEFAULT_SHOW_SIDEBAR = True
+DEFAULT_SIDEBAR_TITLE = "Tapo Face Manager"
+MAX_SIDEBAR_TITLE_LEN = 40
+DEFAULT_RETENTION_DAYS = 90
+DEFAULT_MAX_UNKNOWN_FACES = 100
+DEFAULT_STRANGER_CLEAR_SECONDS = 30
+MIN_STRANGER_CLEAR_SECONDS = 5
+MAX_STRANGER_CLEAR_SECONDS = 600
+MIN_RETENTION_DAYS = 1
+MAX_RETENTION_DAYS = 365
+MIN_MAX_UNKNOWN_FACES = 10
+MAX_MAX_UNKNOWN_FACES = 1000
+
 EVENT_TAPO_AI_DETECTED = f"{DOMAIN}_event"
+EVENT_FACE_DETECTED = f"{DOMAIN}_face_detected"
+EVENT_C260_FACE_DETECTED = "tapo_c260_face_detected"
+
+ATTR_FACE_ID = "face_id"
+ATTR_NAME = "name"
+ATTR_RECOGNIZED = "recognized"
+ATTR_EVENT_TIME = "event_time"
+ATTR_START_TIME = "start_time"
+ATTR_END_TIME = "end_time"
+ATTR_ALARM_TYPE = "alarm_type"
+ATTR_EVENTS_1 = "events_1"
+ATTR_CAMERA = "camera"
+ATTR_EVENT_FACE_IDS = "event_face_ids"
 
 # Known PTZ & Fixed model keywords for fallback detection
+FACE_MODEL_KEYWORDS = (
+    "C260", "TC260",
+)
+
 PTZ_MODEL_KEYWORDS = (
     "C200", "C201", "C206", "C210", "C211", "C212", "C216",
     "C220", "C225", "C230", "C236", "C260",

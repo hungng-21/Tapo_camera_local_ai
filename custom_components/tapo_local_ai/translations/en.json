@@ -2,67 +2,165 @@
   "config": {
     "step": {
       "user": {
-        "title": "Connect Tapo Camera Local AI",
-        "description": "Enter the camera local IP address and Camera Account credentials (configured in Tapo App -> Camera Settings -> Advanced Settings -> Camera Account).",
+        "title": "Connect Tapo Camera Local AI (Ultimate v2.0)",
+        "description": "Enter your camera's local IP address and Camera Account credentials (configured in the Tapo app under Advanced Settings -> Camera Account). For newer firmware (KLAP/TPAP) or Tapo C260 Face Recognition, also enter your TP-Link Cloud password.",
         "data": {
           "host": "Camera IP Address (Host)",
           "username": "Camera Account Username",
           "password": "Camera Account Password",
-          "cloud_password": "TP-Link Cloud Password (Optional for newer FW)",
-          "control_port": "Control Port (Default: 443)",
-          "onvif_port": "ONVIF Event Port (Default: 2020)",
-          "rtsp_port": "RTSP Stream Port (Default: 554)",
-          "poll_interval": "Local AI Event Poll Interval (seconds)",
-          "hold_seconds": "Binary Sensor Hold Time (seconds)",
-          "enable_onvif": "Enable Real-time ONVIF PullPoint Subscription"
+          "cloud_password": "TP-Link Cloud Password (for newer FW & C260 Face AI)",
+          "control_port": "HTTPS/KLAP Control Port (Default: 443)",
+          "onvif_port": "ONVIF Events Port (Default: 2020)",
+          "rtsp_port": "RTSP Video Stream Port (Default: 554)",
+          "poll_interval": "Local AI & Face Event Polling Interval (seconds)",
+          "hold_seconds": "Binary Sensor ON Hold Duration (seconds)",
+          "enable_onvif": "Enable Real-time ONVIF PullPoint Event Stream"
         }
       },
       "reconfigure": {
         "title": "Reconfigure Tapo Camera Local AI",
-        "description": "Update camera IP, credentials, or local AI polling parameters.",
+        "description": "Update camera IP address, credentials, or event polling parameters.",
         "data": {
           "host": "Camera IP Address (Host)",
           "username": "Camera Account Username",
           "password": "Camera Account Password",
-          "cloud_password": "TP-Link Cloud Password (Optional for newer FW)",
-          "control_port": "Control Port (Default: 443)",
-          "onvif_port": "ONVIF Event Port (Default: 2020)",
-          "rtsp_port": "RTSP Stream Port (Default: 554)",
-          "poll_interval": "Local AI Event Poll Interval (seconds)",
-          "hold_seconds": "Binary Sensor Hold Time (seconds)",
-          "enable_onvif": "Enable Real-time ONVIF PullPoint Subscription"
+          "cloud_password": "TP-Link Cloud Password (for newer FW & C260 Face AI)",
+          "control_port": "HTTPS/KLAP Control Port (Default: 443)",
+          "onvif_port": "ONVIF Events Port (Default: 2020)",
+          "rtsp_port": "RTSP Video Stream Port (Default: 554)",
+          "poll_interval": "Local AI & Face Event Polling Interval (seconds)",
+          "hold_seconds": "Binary Sensor ON Hold Duration (seconds)",
+          "enable_onvif": "Enable Real-time ONVIF PullPoint Event Stream"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Tapo Camera ({host})",
+        "description": "Camera at {host} rejected the login. Please verify your Camera Account and TP-Link Cloud password.",
+        "data": {
+          "username": "Camera Account Username",
+          "password": "Camera Account Password",
+          "cloud_password": "TP-Link Cloud Password"
         }
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the Tapo camera. Check IP, Camera Account credentials, and Cloud Password."
+      "cannot_connect": "Unable to connect to the camera. Please verify IP, Camera Account, and Cloud password.",
+      "authentication_failed": "Authentication failed. Please check your Camera Account and TP-Link Cloud password."
     },
     "abort": {
-      "already_configured": "This camera is already configured.",
-      "reconfigure_successful": "Reconfiguration was successful."
+      "already_configured": "This camera is already configured in Home Assistant.",
+      "reconfigure_successful": "Camera configuration updated.",
+      "reauth_successful": "Authentication updated.",
+      "no_faces": "No known Face IDs are configured.",
+      "no_unknown_faces": "No unknown Face IDs have been discovered yet."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Tapo Camera Local AI Options",
-        "description": "Modify camera connection credentials or local AI event polling intervals.",
+        "title": "Tapo Camera Local AI & Face Management",
+        "menu_options": {
+          "connection": "Connection, Ports & ONVIF Settings",
+          "faces": "View Configured Known Face IDs",
+          "unknown_faces": "View Discovered Unknown Face IDs",
+          "add_face": "Add Known Face ID",
+          "add_unknown": "Name a Discovered Unknown Face ID",
+          "edit_face": "Edit Known Face ID / Name",
+          "delete_face": "Delete Known Face ID",
+          "polling": "Polling & Face Deduplication",
+          "retention": "Storage Limits (History Days / Max Strangers)",
+          "sidebar": "Tapo Face Manager Sidebar Panel"
+        }
+      },
+      "connection": {
+        "title": "Connection, Ports & ONVIF Settings",
+        "description": "Modify camera connection credentials, ports, or ONVIF PullPoint settings.",
         "data": {
           "host": "Camera IP Address (Host)",
           "username": "Camera Account Username",
           "password": "Camera Account Password",
-          "cloud_password": "TP-Link Cloud Password (Optional for newer FW)",
-          "control_port": "Control Port (Default: 443)",
-          "onvif_port": "ONVIF Event Port (Default: 2020)",
-          "rtsp_port": "RTSP Stream Port (Default: 554)",
-          "poll_interval": "Local AI Event Poll Interval (seconds)",
-          "hold_seconds": "Binary Sensor Hold Time (seconds)",
-          "enable_onvif": "Enable Real-time ONVIF PullPoint Subscription"
+          "cloud_password": "TP-Link Cloud Password (for newer FW & C260 Face AI)",
+          "control_port": "HTTPS/KLAP Control Port (Default: 443)",
+          "onvif_port": "ONVIF Events Port (Default: 2020)",
+          "rtsp_port": "RTSP Video Stream Port (Default: 554)",
+          "poll_interval": "Local AI & Face Event Polling Interval (seconds)",
+          "hold_seconds": "Binary Sensor ON Hold Duration (seconds)",
+          "enable_onvif": "Enable Real-time ONVIF PullPoint Event Stream"
+        }
+      },
+      "faces": {
+        "title": "Configured Known Face IDs",
+        "description": "{faces}"
+      },
+      "unknown_faces": {
+        "title": "Discovered Unknown Face IDs",
+        "description": "{unknown_faces}"
+      },
+      "add_face": {
+        "title": "Add Known Face ID",
+        "description": "Enter the numeric Face ID detected by the camera and the person's name.",
+        "data": {
+          "face_id": "Face ID (digits only)",
+          "name": "Person Name"
+        }
+      },
+      "add_unknown": {
+        "title": "Name a Discovered Unknown Face ID",
+        "description": "Select a discovered Face ID and assign a name.",
+        "data": {
+          "face_id": "Face ID",
+          "name": "Person Name"
+        }
+      },
+      "edit_face": {
+        "title": "Edit Known Face ID / Name",
+        "description": "Select an existing mapping and update its Face ID or name.",
+        "data": {
+          "old_face_id": "Current Face ID",
+          "new_face_id": "New Face ID",
+          "name": "Person Name"
+        }
+      },
+      "delete_face": {
+        "title": "Delete Known Face ID",
+        "description": "Select the Face ID mapping to remove.",
+        "data": {
+          "face_id": "Face ID"
+        }
+      },
+      "polling": {
+        "title": "Polling & Face Deduplication",
+        "description": "Configure event polling interval, binary sensor hold time, and known-face deduplication cooldown.",
+        "data": {
+          "poll_interval": "Polling interval (seconds)",
+          "hold_seconds": "AI Binary Sensor hold duration (seconds)",
+          "history_seconds": "Event history window per poll (seconds)",
+          "dedup_seconds": "Known-face deduplication cooldown (seconds)",
+          "stranger_clear_seconds": "Auto-off \"Stranger Detected\" after (seconds)"
+        }
+      },
+      "retention": {
+        "title": "Storage Limits",
+        "description": "Automatically prune history and strangers older than retention_days, and cap total stored strangers.",
+        "data": {
+          "retention_days": "Days to keep statistics / strangers (1–365)",
+          "max_unknown_faces": "Maximum number of strangers (10–1000)"
+        }
+      },
+      "sidebar": {
+        "title": "Tapo Face Manager Sidebar Panel",
+        "description": "Show or hide the Tapo Face Manager panel in the Home Assistant sidebar. When hidden, it remains accessible at [/tapo_local_ai](/tapo_local_ai).",
+        "data": {
+          "show_sidebar": "Show in sidebar",
+          "sidebar_title": "Sidebar title"
         }
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the Tapo camera with the updated settings."
+      "cannot_connect": "Unable to connect to the camera with the provided settings.",
+      "invalid_face_id": "Face ID must contain digits only.",
+      "invalid_name": "Name cannot be empty.",
+      "face_id_exists": "This Face ID already exists."
     }
   }
 }

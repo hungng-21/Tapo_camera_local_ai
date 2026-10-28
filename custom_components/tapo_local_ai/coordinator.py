@@ -1,8 +1,9 @@
-"""DataUpdateCoordinator and ONVIF PullPoint listener for Tapo Camera Local AI."""
+"""DataUpdateCoordinator, ONVIF PullPoint listener, and C260 Face Recognition Engine for Tapo Camera Local AI."""
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from collections.abc import Callable, Mapping
+from datetime import date, datetime, timedelta, timezone
 import logging
 import os
 import socket
@@ -14,36 +15,72 @@ from pytapo import Tapo
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
+from .api import TapoC260Api
 from .const import (
     AI_BINARY_SENSORS,
     AI_DETECTION_SWITCHES,
     AI_SENSITIVITY_SPECS,
+    ATTR_ALARM_TYPE,
+    ATTR_CAMERA,
+    ATTR_END_TIME,
+    ATTR_EVENT_FACE_IDS,
+    ATTR_EVENT_TIME,
+    ATTR_EVENTS_1,
+    ATTR_FACE_ID,
+    ATTR_NAME,
+    ATTR_RECOGNIZED,
+    ATTR_START_TIME,
     CONF_CLOUD_PASSWORD,
     CONF_CONTROL_PORT,
+    CONF_DEDUP_SECONDS,
     CONF_ENABLE_ONVIF,
+    CONF_FACES,
+    CONF_HISTORY_SECONDS,
     CONF_HOLD_SECONDS,
+    CONF_MAX_UNKNOWN_FACES,
     CONF_ONVIF_PORT,
     CONF_POLL_INTERVAL,
+    CONF_RETENTION_DAYS,
     CONF_RTSP_PORT,
+    CONF_STRANGER_CLEAR_SECONDS,
     DEFAULT_CONTROL_PORT,
+    DEFAULT_DEDUP_SECONDS,
     DEFAULT_ENABLE_ONVIF,
+    DEFAULT_FACE_NAME,
+    DEFAULT_HISTORY_SECONDS,
     DEFAULT_HOLD_SECONDS,
+    DEFAULT_MAX_UNKNOWN_FACES,
     DEFAULT_MICROPHONE_VOLUME,
     DEFAULT_ONVIF_PORT,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_PTZ_STEP_ANGLE,
+    DEFAULT_RETENTION_DAYS,
     DEFAULT_RTSP_PORT,
     DEFAULT_SIREN_DURATION,
     DEFAULT_SIREN_VOLUME,
     DEFAULT_SPEAKER_VOLUME,
+    DEFAULT_STRANGER_CLEAR_SECONDS,
     DOMAIN,
+    EVENT_C260_FACE_DETECTED,
+    EVENT_FACE_DETECTED,
     EVENT_TAPO_AI_DETECTED,
+    FACE_MODEL_KEYWORDS,
     FIXED_MODEL_KEYWORDS,
     LIGHT_FREQUENCY_FROM_API,
     LIGHT_FREQUENCY_TO_API,
+    MAX_MAX_UNKNOWN_FACES,
+    MAX_RETENTION_DAYS,
+    MAX_STRANGER_CLEAR_SECONDS,
+    MIN_MAX_UNKNOWN_FACES,
+    MIN_RETENTION_DAYS,
+    MIN_STRANGER_CLEAR_SECONDS,
     NIGHT_VISION_FROM_API,
     NIGHT_VISION_TO_API,
     NIGHT_VISION_TO_DAYNIGHT,
@@ -51,10 +88,30 @@ from .const import (
     TapoAISwitchSpec,
     TapoSensitivitySpec,
 )
+from .history import FaceHistory
 
 _LOGGER = logging.getLogger(__name__)
 
 PULLPOINT_NS = "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription"
+HISTORY_SAVE_DELAY = 30
+
+
+def _clamp(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
+def history_store(hass: HomeAssistant, entry_id: str) -> Store:
+    """Return persistent Store for per-entry Face Recognition history."""
+    return Store(hass, 1, f"{DOMAIN}.history.{entry_id}")
+
+
+async def async_load_history(hass: HomeAssistant, entry_id: str) -> FaceHistory:
+    """Load persisted FaceHistory from disk (works even when entry is not loaded)."""
+    return FaceHistory.from_dict(await history_store(hass, entry_id).async_load())
 
 
 def check_tcp_port(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -86,10 +143,14 @@ def connect_tapo_multi_auth(
     if clean_user:
         candidates.append(("camera_account_only", clean_user, clean_pass, ""))
 
-    candidates.append(("admin + camera_password", "admin", clean_pass, clean_cloud or clean_pass))
+    candidates.append(
+        ("admin + camera_password", "admin", clean_pass, clean_cloud or clean_pass)
+    )
 
     if clean_cloud and clean_user and clean_user.lower() != "admin":
-        candidates.append(("camera_account + cloud_password", clean_user, clean_pass, clean_cloud))
+        candidates.append(
+            ("camera_account + cloud_password", clean_user, clean_pass, clean_cloud)
+        )
 
     last_err: Exception | None = None
     seen: set[tuple[str, str, str]] = set()
@@ -159,7 +220,16 @@ def parse_tapo_basic_info(basic_raw: dict[str, Any], host: str) -> dict[str, str
     }
 
 
-def infer_ptz_from_model_or_user(model: str, username: str, title: str) -> bool | None:
+
+def infer_face_detection_from_model(model: str) -> bool:
+    """Infer whether the camera hardware supports on-device Face Recognition."""
+    m = model.upper()
+    return any(kw in m for kw in FACE_MODEL_KEYWORDS)
+
+
+def infer_ptz_from_model_or_user(
+    model: str, username: str, title: str
+) -> bool | None:
     """Infer PTZ capability from model string or camera account name if API check is inconclusive."""
     combined = f"{model} {username} {title}".upper()
     for kw in FIXED_MODEL_KEYWORDS:
@@ -193,14 +263,14 @@ def word_to_level10(word: str) -> int:
 
 
 class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinator managing local pytapo polling, ONVIF PullPoint push, PTZ, Siren, and AI settings."""
+    """Unified Coordinator managing local pytapo polling, ONVIF PullPoint, C260 Face Recognition, PTZ, Siren, and AI settings."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the coordinator."""
         self.entry = entry
         self.host: str = entry.data[CONF_HOST].strip()
         self.username: str = entry.data[CONF_USERNAME].strip()
-        self.password: str = entry.data[CONF_PASSWORD]
+        self.password: str = entry.data.get(CONF_PASSWORD, "")
         self.cloud_password: str = entry.data.get(CONF_CLOUD_PASSWORD, "").strip()
         self.control_port: int = int(
             entry.data.get(CONF_CONTROL_PORT, DEFAULT_CONTROL_PORT)
@@ -212,41 +282,82 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             entry.data.get(CONF_RTSP_PORT, DEFAULT_RTSP_PORT)
         )
 
+        options = entry.options
         self.poll_interval: int = int(
-            entry.options.get(
+            options.get(
                 CONF_POLL_INTERVAL,
                 entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
             )
         )
         self.hold_seconds: int = int(
-            entry.options.get(
+            options.get(
                 CONF_HOLD_SECONDS,
                 entry.data.get(CONF_HOLD_SECONDS, DEFAULT_HOLD_SECONDS),
             )
         )
         self.enable_onvif: bool = bool(
-            entry.options.get(
+            options.get(
                 CONF_ENABLE_ONVIF,
                 entry.data.get(CONF_ENABLE_ONVIF, DEFAULT_ENABLE_ONVIF),
             )
+        )
+
+        # Face Recognition & Face Manager options
+        self.history_seconds: int = int(
+            options.get(CONF_HISTORY_SECONDS, DEFAULT_HISTORY_SECONDS)
+        )
+        self.dedup_seconds: int = int(
+            options.get(CONF_DEDUP_SECONDS, DEFAULT_DEDUP_SECONDS)
+        )
+        self.stranger_clear_seconds: int = _clamp(
+            options.get(CONF_STRANGER_CLEAR_SECONDS),
+            DEFAULT_STRANGER_CLEAR_SECONDS,
+            MIN_STRANGER_CLEAR_SECONDS,
+            MAX_STRANGER_CLEAR_SECONDS,
+        )
+        self.retention_days: int = _clamp(
+            options.get(CONF_RETENTION_DAYS),
+            DEFAULT_RETENTION_DAYS,
+            MIN_RETENTION_DAYS,
+            MAX_RETENTION_DAYS,
+        )
+        self.max_unknown_faces: int = _clamp(
+            options.get(CONF_MAX_UNKNOWN_FACES),
+            DEFAULT_MAX_UNKNOWN_FACES,
+            MIN_MAX_UNKNOWN_FACES,
+            MAX_MAX_UNKNOWN_FACES,
         )
 
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN}_{self.host}",
+            config_entry=entry,
             update_interval=timedelta(seconds=self.poll_interval),
+            always_update=True,
         )
 
         self.tapo: Tapo | None = None
+        # Built-in C260 direct securePassthrough fallback client
+        self.api = TapoC260Api(
+            async_get_clientsession(hass),
+            self.host,
+            self.username,
+            self.cloud_password or self.password,
+            hass=hass,
+        )
+
         self.device_model: str = "Tapo Camera"
         self.device_name: str = entry.title or f"Tapo ({self.host})"
         self.device_mac: str = self.host.replace(".", "_")
         self.firmware_version: str = "Unknown"
-        self.serial_number: str = entry.unique_id or f"tapo_{self.host.replace('.', '_')}"
+        self.serial_number: str = (
+            entry.unique_id or f"tapo_{self.host.replace('.', '_')}"
+        )
 
         # PTZ capability & state
         self.supports_ptz: bool = False
+        self.supports_face: bool = infer_face_detection_from_model(self.device_model) or bool(self.faces)
         self.ptz_step_angle: int = DEFAULT_PTZ_STEP_ANGLE
         self.presets: dict[str, str] = {}
         self.patrol_mode: str = "Off"
@@ -294,6 +405,41 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._supported_switch_specs: list[TapoAISwitchSpec] | None = None
         self._poll_counter: int = 0
 
+        # Face Recognition & History state
+        self._face_current: dict[str, Any] = {
+            ATTR_FACE_ID: None,
+            ATTR_NAME: DEFAULT_FACE_NAME,
+            ATTR_RECOGNIZED: False,
+        }
+        self._seen_face_events: dict[str, float] = {}
+        self._last_face_event: dict[str, float] = {}
+        self._baseline_done: bool = False
+        self._unknown_faces: dict[str, dict[str, Any]] = {}
+        self._unknown_store = Store(
+            hass, 1, f"{DOMAIN}.unknown_faces.{entry.entry_id}"
+        )
+        self.history = FaceHistory()
+        self._history_store = history_store(hass, entry.entry_id)
+        self._known_snapshot: set[str] = set(self.faces)
+        self._last_prune_day: date | None = None
+
+        # Health & diagnostics state
+        self._mode: str = "starting"
+        self._last_success: datetime | None = None
+        self._last_attempt: datetime | None = None
+        self._last_response_ms: int | None = None
+        self._consecutive_failures: int = 0
+        self._total_failures: int = 0
+        self._last_error: str | None = None
+        self._last_error_time: datetime | None = None
+        self._dedup_skipped: int = 0
+        self._events_processed: int = 0
+
+        # Stranger binary sensor & Face Event listeners
+        self.stranger_active: bool = False
+        self._stranger_unsub: Callable[[], None] | None = None
+        self._face_listeners: list[Callable[[dict[str, Any]], None]] = []
+
         # Backoff tracking for port 443 control API
         self._last_connect_attempt_ts: float = 0.0
         self._connect_retry_cooldown: float = 60.0
@@ -302,6 +448,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._onvif_task: asyncio.Task | None = None
         self._stop_onvif = asyncio.Event()
         self._api_lock = asyncio.Lock()
+
+    # ---------------- Device & Face Properties ----------------
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -315,6 +463,87 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             configuration_url=f"https://{self.host}:{self.control_port}",
         )
 
+    @property
+    def unknown_faces(self) -> dict[str, dict[str, Any]]:
+        """Return discovered Face IDs not currently mapped."""
+        return dict(self._unknown_faces)
+
+    @property
+    def known_face_count(self) -> int:
+        """Return number of configured known faces."""
+        return len(self.faces)
+
+    @property
+    def unknown_face_count(self) -> int:
+        """Return number of discovered unknown faces."""
+        return len(self._unknown_faces)
+
+    @property
+    def faces(self) -> dict[str, str]:
+        """Return configured Face ID/name mappings."""
+        faces = self.entry.options.get(CONF_FACES, {})
+        if not isinstance(faces, Mapping):
+            return {}
+        return {str(k): str(v) for k, v in faces.items()}
+
+    @property
+    def current(self) -> dict[str, Any]:
+        """Return current face state."""
+        return dict(self._face_current)
+
+    @callback
+    def lookup_face(self, face_id: str) -> tuple[str, bool]:
+        """Map Face ID to configured name."""
+        name = self.faces.get(str(face_id))
+        if name:
+            return name, True
+        return DEFAULT_FACE_NAME, False
+
+    @callback
+    def health(self) -> dict[str, Any]:
+        """Return integration health & polling diagnostics."""
+        stale_after = max(self.poll_interval * 3, 60)
+        now = dt_util.utcnow()
+        if self._consecutive_failures:
+            status = "error"
+        elif self._mode == "wait":
+            status = "waiting"
+        elif self._last_success is None:
+            status = "starting"
+        elif (now - self._last_success).total_seconds() > stale_after:
+            status = "stale"
+        else:
+            status = "ok"
+        return {
+            "status": status,
+            "connected": status in ("ok", "waiting"),
+            "mode": self._mode,
+            "last_success": (
+                self._last_success.isoformat() if self._last_success else None
+            ),
+            "last_attempt": (
+                self._last_attempt.isoformat() if self._last_attempt else None
+            ),
+            "response_ms": self._last_response_ms,
+            "consecutive_failures": self._consecutive_failures,
+            "total_failures": self._total_failures,
+            "last_error": self._last_error,
+            "last_error_time": (
+                self._last_error_time.isoformat() if self._last_error_time else None
+            ),
+            "dedup_skipped": self._dedup_skipped,
+            "events_processed": self._events_processed,
+        }
+
+    def _record_poll_failure(self, exc: Exception) -> None:
+        self._consecutive_failures += 1
+        self._total_failures += 1
+        self._last_error = f"{type(exc).__name__}: {exc}"[:300]
+        self._last_error_time = dt_util.utcnow()
+        self.async_update_listeners()
+
+    # ---------------- Setup & Shutdown ----------------
+
     def _connect_tapo_sync(self) -> dict[str, Any]:
         """Connect to Tapo camera synchronously in executor using multi-auth fallback."""
         self._last_connect_attempt_ts = time.monotonic()
@@ -326,6 +555,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.control_port,
         )
         self.tapo = tapo
+        self.api.shared_controller = tapo
         return basic_info
 
     def _detect_ptz_and_presets_sync(self) -> tuple[bool, dict[str, str]]:
@@ -360,7 +590,31 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return bool(inferred), {}
 
     async def async_setup(self) -> None:
-        """Initialize local connection to Tapo camera, detect PTZ capability, and start ONVIF listener."""
+        """Initialize persistent Face stores, local camera connection, PTZ detection, and ONVIF listener."""
+        # 1. Load persistent unknown faces and appearance history from .storage
+        stored = await self._unknown_store.async_load()
+        if isinstance(stored, Mapping):
+            self._unknown_faces = {
+                str(face_id): dict(value)
+                for face_id, value in stored.items()
+                if isinstance(value, Mapping)
+            }
+
+        known_ids = set(self.faces)
+        self._unknown_faces = {
+            face_id: value
+            for face_id, value in self._unknown_faces.items()
+            if face_id not in known_ids
+        }
+
+        self.history = FaceHistory.from_dict(await self._history_store.async_load())
+        self._known_snapshot = set(self.faces)
+        self._prune_all()
+
+        await self._unknown_store.async_save(self._unknown_faces)
+        self._schedule_history_save()
+
+        # 2. Connect to Tapo Control API (port 443)
         try:
             basic_raw = await self.hass.async_add_executor_job(self._connect_tapo_sync)
             meta = parse_tapo_basic_info(basic_raw, self.host)
@@ -369,18 +623,23 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.device_mac = meta["mac"]
             self.firmware_version = meta["sw_version"]
             self.serial_number = meta["serial"]
+            self._mode = "standalone"
+            self.supports_face = infer_face_detection_from_model(self.device_model) or bool(self.faces)
         except Exception as err:
             _LOGGER.warning(
-                "API điều khiển cổng %s trên %s chưa phản hồi (%s). "
-                "Integration vẫn khởi chạy bình thường với luồng RTSP (cổng %s) & ONVIF (cổng %s).",
+                "API điều khiển cổng %s trên %s chưa phản hồi qua pytapo (%s). "
+                "Thử kết nối dự phòng C260 Secure Channel / RTSP / ONVIF.",
                 self.control_port,
                 self.host,
                 err,
-                self.rtsp_port,
-                self.onvif_port,
             )
+            try:
+                await self.api.async_login()
+                self._mode = "standalone"
+            except Exception as c260_err:
+                _LOGGER.debug("C260 fallback login trên %s chưa sẵn sàng: %s", self.host, c260_err)
 
-        # Detect PTZ capability & presets BEFORE querying switches so fixed cameras skip motor queries
+        # 3. Detect PTZ capability & presets
         try:
             self.supports_ptz, self.presets = await self.hass.async_add_executor_job(
                 self._detect_ptz_and_presets_sync
@@ -412,7 +671,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
     async def async_shutdown(self) -> None:
-        """Clean up ONVIF subscription, siren timer, and close Tapo transport."""
+        """Clean up ONVIF subscription, siren timer, stranger timer, and close Tapo transport."""
+        self.async_cancel_timers()
         self._stop_onvif.set()
         if self._siren_auto_off_task and not self._siren_auto_off_task.done():
             self._siren_auto_off_task.cancel()
@@ -423,11 +683,51 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except asyncio.CancelledError:
                 pass
 
+    # ---------------- Event Polling & Face Recognition Processing ----------------
+
+    @staticmethod
+    def _extract_events_from_response(response: Any) -> list[dict[str, Any]] | None:
+        """Extract search_detection_list from any known Tapo / pytapo response wrapper."""
+        if isinstance(response, list):
+            return response
+        candidates = [response]
+        if isinstance(response, dict):
+            result = response.get("result")
+            if isinstance(result, dict):
+                candidates.append(result)
+                playback = result.get("playback")
+                if isinstance(playback, dict):
+                    candidates.append(playback)
+                responses = result.get("responses")
+                if isinstance(responses, list) and responses:
+                    first_res = responses[0].get("result", {}) if isinstance(responses[0], dict) else {}
+                    if isinstance(first_res, dict):
+                        candidates.append(first_res)
+                        pb2 = first_res.get("playback")
+                        if isinstance(pb2, dict):
+                            candidates.append(pb2)
+            playback = response.get("playback")
+            if isinstance(playback, dict):
+                candidates.append(playback)
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            events = candidate.get("search_detection_list")
+            if isinstance(events, list):
+                return events
+            events = candidate.get("events")
+            if isinstance(events, list):
+                return events
+        return None
+
     def _poll_camera_events_sync(self) -> list[dict[str, Any]]:
-        """Query local searchDetectionList via pytapo.getEvents()."""
+        """Query local searchDetectionList preserving both AI alarm_type/events_1 and C260 event_info (face_id)."""
         if self.tapo is None:
-            if (time.monotonic() - self._last_connect_attempt_ts) < self._connect_retry_cooldown:
-                return []
+            if (
+                time.monotonic() - self._last_connect_attempt_ts
+            ) < self._connect_retry_cooldown:
+                raise RuntimeError("Đang trong thời gian chờ kết nối lại cổng 443")
             self._connect_tapo_sync()
             try:
                 self.supports_ptz, self.presets = self._detect_ptz_and_presets_sync()
@@ -437,18 +737,52 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         assert self.tapo is not None
         now_ts = int(time.time())
+        window = max(90, int(self.history_seconds), int(self.hold_seconds) * 2)
 
+        # 1. Direct searchDetectionList with UTC timestamps (used by Tapo C260 and modern FW; preserves event_info.face_id)
         try:
-            events = self.tapo.getEvents(startTime=now_ts - 90, endTime=now_ts + 15)
-            if isinstance(events, list):
-                return events
+            raw = self.tapo.executeFunction(
+                "searchDetectionList",
+                {
+                    "playback": {
+                        "search_detection_list": {
+                            "start_index": 0,
+                            "end_index": 999,
+                            "channel": 0,
+                            "start_time": now_ts - window,
+                            "end_time": now_ts + 15,
+                        }
+                    }
+                },
+            )
+            direct_events = self._extract_events_from_response(raw)
+            if isinstance(direct_events, list) and direct_events:
+                # Check if timestamps are already close to UTC epoch now_ts
+                sample_ts = int(direct_events[0].get("start_time") or now_ts)
+                if sample_ts > 10_000_000_000:
+                    sample_ts = int(sample_ts / 1000)
+                if abs(now_ts - sample_ts) <= (window + 900):
+                    return direct_events
         except Exception as err:
             _LOGGER.debug(
-                "getEvents() trên %s trả về lỗi (%s), thử gọi trực tiếp searchDetectionList",
+                "searchDetectionList trực tiếp trên %s trả về lỗi (%s), thử qua getEvents()",
                 self.host,
                 err,
             )
 
+        # 2. Try pytapo.getEvents() (handles cameras whose internal clock requires timeCorrection)
+        try:
+            events = self.tapo.getEvents(startTime=now_ts - window, endTime=now_ts + 15)
+            if isinstance(events, list):
+                return events
+        except Exception as err:
+            _LOGGER.debug(
+                "getEvents() trên %s trả về lỗi (%s), thử searchDetectionList có bù múi giờ",
+                self.host,
+                err,
+            )
+
+        # 3. Fallback with explicit timeCorrection
         time_corr = 0
         try:
             tc = self.tapo.getTimeCorrection()
@@ -458,51 +792,65 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             time_corr = 0
 
         cam_now = now_ts - time_corr
-        raw = self.tapo.executeFunction(
+        raw_tc = self.tapo.executeFunction(
             "searchDetectionList",
             {
                 "playback": {
                     "search_detection_list": {
                         "start_index": 0,
+                        "end_index": 999,
                         "channel": 0,
-                        "start_time": cam_now - 90,
+                        "start_time": cam_now - window,
                         "end_time": cam_now + 15,
-                        "end_index": 50,
                     }
                 }
             },
         )
-        det_list = (
-            raw.get("playback", {}).get("search_detection_list", [])
-            if isinstance(raw, dict)
-            else []
-        )
+        det_list = self._extract_events_from_response(raw_tc) or []
         results: list[dict[str, Any]] = []
-        if isinstance(det_list, list):
-            for ev in det_list:
-                ev_copy = dict(ev)
-                ev_copy["start_time"] = int(ev_copy.get("start_time", cam_now)) + time_corr
-                ev_copy["end_time"] = int(ev_copy.get("end_time", cam_now)) + time_corr
-                results.append(ev_copy)
+        for ev in det_list:
+            ev_copy = dict(ev)
+            ev_copy["start_time"] = int(ev_copy.get("start_time", cam_now)) + time_corr
+            ev_copy["end_time"] = int(ev_copy.get("end_time", cam_now)) + time_corr
+            results.append(ev_copy)
         return results
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch latest local AI detection events from camera without marking entities unavailable on transient errors."""
+        """Fetch latest local AI detection events and C260 Face Recognition events."""
         now_ts = time.time()
+        self._last_attempt = dt_util.utcnow()
+        fetch_started = time.monotonic()
         events: list[dict[str, Any]] = []
+        poll_ok = False
 
         try:
             async with self._api_lock:
                 events = await self.hass.async_add_executor_job(
                     self._poll_camera_state_and_events_sync
                 )
+                poll_ok = True
+                self._mode = "standalone"
         except Exception as err:
-            _LOGGER.debug(
-                "Bỏ qua lỗi tạm thời khi quét trạng thái & sự kiện trên %s: %s",
-                self.host,
-                err,
-            )
+            # Try C260 direct async client if pytapo session failed
+            try:
+                window = max(90, int(self.history_seconds), int(self.hold_seconds) * 2)
+                events = await self.api.async_search_detection_list(window)
+                poll_ok = True
+                self._mode = "standalone"
+            except Exception:
+                self._record_poll_failure(err)
+                _LOGGER.debug(
+                    "Bỏ qua lỗi tạm thời khi quét trạng thái & sự kiện trên %s: %s",
+                    self.host,
+                    err,
+                )
 
+        if poll_ok:
+            self._last_response_ms = round((time.monotonic() - fetch_started) * 1000)
+            self._last_success = dt_util.utcnow()
+            self._consecutive_failures = 0
+
+        # 1. Process general AI detection events (Baby Cry, Bark, Meow, Glass Break, Person, Pet, Vehicle, Motion, etc.)
         for ev in events:
             try:
                 alarm_type = int(ev.get("alarm_type", 0))
@@ -514,8 +862,10 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except (ValueError, TypeError):
                 events_1 = 0
 
-            start_time = int(ev.get("start_time", 0))
-            end_time = int(ev.get("end_time", start_time))
+            start_time = int(self._event_timestamp_seconds(ev.get("start_time")))
+            end_time = int(
+                self._event_timestamp_seconds(ev.get("end_time")) or start_time
+            )
             sig = (start_time, alarm_type, events_1)
 
             age_since_end = now_ts - max(start_time, end_time)
@@ -535,8 +885,16 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             now_ts if sig not in self._seen_event_signatures else 0.0,
                         )
                         self._last_event_meta[spec.key] = {
-                            "last_event_start": datetime.fromtimestamp(start_time).isoformat(),
-                            "last_event_end": datetime.fromtimestamp(end_time).isoformat(),
+                            "last_event_start": datetime.fromtimestamp(
+                                start_time
+                            ).isoformat()
+                            if start_time > 0
+                            else None,
+                            "last_event_end": datetime.fromtimestamp(
+                                end_time
+                            ).isoformat()
+                            if end_time > 0
+                            else None,
                             "alarm_type_id": alarm_type,
                             "events_1_bitmask": events_1,
                             "detection_source": "tapo_local_api",
@@ -556,7 +914,482 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 s for s in self._seen_event_signatures if s[0] >= cutoff
             }
 
+        # 2. Process C260 Face Recognition events (event_info -> face_id)
+        if poll_ok:
+            await self._async_process_face_events(events)
+
         return self._build_state_snapshot(now_ts)
+
+    async def _async_process_face_events(
+        self, events: list[dict[str, Any]]
+    ) -> None:
+        """Process C260 Face IDs from searchDetectionList events."""
+        latest: dict[str, Any] | None = None
+        latest_key: tuple[float, float, int] | None = None
+        now = time.monotonic()
+        baseline = not self._baseline_done
+
+        for event_index, event in enumerate(events):
+            event_info = event.get("event_info")
+            if not isinstance(event_info, list):
+                continue
+
+            candidates: list[tuple[str, str, bool, int]] = []
+            seen_ids: set[str] = set()
+            for info_index, info in enumerate(event_info):
+                if not isinstance(info, Mapping):
+                    continue
+                face_value = info.get("face_id")
+                if face_value is None:
+                    continue
+                candidate_id = str(face_value)
+                if candidate_id in seen_ids:
+                    continue
+                seen_ids.add(candidate_id)
+                candidate_name, candidate_recognized = self.lookup_face(candidate_id)
+                candidates.append(
+                    (candidate_id, candidate_name, candidate_recognized, info_index)
+                )
+            if not candidates:
+                continue
+
+            event_time = self._event_timestamp_iso(
+                event.get("start_time"), event.get("end_time")
+            )
+            event_face_ids = [c[0] for c in candidates]
+
+            def build_payload(
+                candidate: tuple[str, str, bool, int],
+                ev: dict[str, Any] = event,
+                ev_time: str = event_time,
+                ev_fids: list[str] = event_face_ids,
+            ) -> dict[str, Any]:
+                return {
+                    ATTR_FACE_ID: candidate[0],
+                    ATTR_NAME: candidate[1],
+                    ATTR_RECOGNIZED: candidate[2],
+                    ATTR_EVENT_TIME: ev_time,
+                    ATTR_START_TIME: ev.get("start_time"),
+                    ATTR_END_TIME: ev.get("end_time"),
+                    ATTR_ALARM_TYPE: ev.get("alarm_type"),
+                    ATTR_EVENTS_1: ev.get("events_1"),
+                    ATTR_CAMERA: self.entry.title,
+                    ATTR_EVENT_FACE_IDS: ev_fids,
+                }
+
+            best = max(candidates, key=lambda item: (item[2], item[3]))
+            order_key = (
+                self._event_timestamp_seconds(event.get("start_time")),
+                self._event_timestamp_seconds(event.get("end_time")),
+                event_index,
+            )
+            if latest_key is None or order_key > latest_key:
+                latest = build_payload(best)
+                latest_key = order_key
+
+            event_marker = event.get("start_time")
+            if event_marker is None:
+                event_marker = event.get("end_time")
+            if event_marker is None:
+                event_marker = (
+                    event.get("alarm_type"),
+                    event.get("events_1"),
+                    repr(event_info),
+                )
+
+            for candidate in sorted(candidates, key=lambda item: item[3]):
+                face_id, _name, recognized, _idx = candidate
+                seen_key = f"{face_id}|{event_marker}"
+                if seen_key in self._seen_face_events:
+                    continue
+                self._seen_face_events[seen_key] = now
+
+                if baseline:
+                    continue
+
+                if recognized:
+                    last = self._last_face_event.get(face_id)
+                    if last is not None and now - last < self.dedup_seconds:
+                        self._dedup_skipped += 1
+                        continue
+                    self._last_face_event[face_id] = now
+                else:
+                    await self._record_unknown_face(face_id)
+
+                payload = build_payload(candidate)
+                self._events_processed += 1
+                self._record_history(face_id, payload[ATTR_EVENT_TIME])
+                # Fire both tapo_local_ai_face_detected and tapo_c260_face_detected for full automation compatibility
+                self.hass.bus.async_fire(EVENT_FACE_DETECTED, payload)
+                self.hass.bus.async_fire(EVENT_C260_FACE_DETECTED, payload)
+                self._notify_face(payload)
+                if not recognized:
+                    self._mark_stranger()
+
+        self._baseline_done = True
+        await self._async_daily_prune()
+
+        expiry = now - max(self.history_seconds * 2, 300)
+        self._seen_face_events = {
+            key: seen_at
+            for key, seen_at in self._seen_face_events.items()
+            if seen_at >= expiry
+        }
+
+        if latest is not None:
+            self._face_current = latest
+
+    @staticmethod
+    def _event_timestamp_seconds(value: Any) -> float:
+        """Normalize a camera event timestamp to Unix seconds."""
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+        return timestamp
+
+    @classmethod
+    def _event_timestamp_iso(cls, start_time: Any, end_time: Any) -> str:
+        """Return the camera event time as an ISO-8601 UTC timestamp."""
+        timestamp = cls._event_timestamp_seconds(start_time)
+        if timestamp <= 0:
+            timestamp = cls._event_timestamp_seconds(end_time)
+        if timestamp <= 0:
+            return datetime.now(timezone.utc).isoformat()
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+    async def _record_unknown_face(self, face_id: str) -> None:
+        """Persist an unknown Face ID for later classification."""
+        now = datetime.now(timezone.utc).isoformat()
+        item = self._unknown_faces.get(face_id)
+        if item is None:
+            self._unknown_faces[face_id] = {
+                "first_seen": now,
+                "last_seen": now,
+                "count": 1,
+            }
+            self._cap_unknown()
+            await self._unknown_store.async_save(self._unknown_faces)
+            return
+
+        item["last_seen"] = now
+        item["count"] = int(item.get("count", 0)) + 1
+
+        last_saved = item.get("last_saved")
+        try:
+            should_save = (
+                last_saved is None
+                or datetime.fromisoformat(last_saved)
+                < datetime.now(timezone.utc) - timedelta(seconds=60)
+            )
+        except (TypeError, ValueError):
+            should_save = True
+
+        if should_save:
+            item["last_saved"] = now
+            await self._unknown_store.async_save(self._unknown_faces)
+
+    # ---------------- Stranger & Face History Methods ----------------
+
+    @callback
+    def async_add_face_listener(
+        self, listener: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register listener for each newly detected face event (used by EventEntity)."""
+        self._face_listeners.append(listener)
+
+        @callback
+        def _remove() -> None:
+            if listener in self._face_listeners:
+                self._face_listeners.remove(listener)
+
+        return _remove
+
+    def _notify_face(self, payload: dict[str, Any]) -> None:
+        for listener in list(self._face_listeners):
+            try:
+                listener(payload)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Face event listener failed")
+
+    def _mark_stranger(self) -> None:
+        """Turn ON Stranger Detected binary sensor and schedule auto-off timer."""
+        self.stranger_active = True
+        self._cancel_stranger_timer()
+        self._stranger_unsub = async_call_later(
+            self.hass, self.stranger_clear_seconds, self._clear_stranger
+        )
+
+    @callback
+    def _clear_stranger(self, _now: datetime | None = None) -> None:
+        self._stranger_unsub = None
+        self.stranger_active = False
+        self.async_update_listeners()
+
+    def _cancel_stranger_timer(self) -> None:
+        if self._stranger_unsub is not None:
+            self._stranger_unsub()
+            self._stranger_unsub = None
+
+    @callback
+    def async_cancel_timers(self) -> None:
+        self._cancel_stranger_timer()
+        self.stranger_active = False
+
+    @property
+    def unknown_today(self) -> int:
+        """Number of stranger detections today (local time)."""
+        known = set(self.faces)
+        bucket = self.history.days.get(dt_util.now().date().isoformat(), {})
+        return sum(n for fid, n in bucket.items() if fid not in known)
+
+    @property
+    def last_unknown_seen(self) -> datetime | None:
+        known = set(self.faces)
+        latest = max(
+            (v for fid, v in self.history.last_seen.items() if fid not in known),
+            default=None,
+        )
+        if not latest:
+            return None
+        try:
+            parsed = datetime.fromisoformat(latest)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    def _schedule_history_save(self) -> None:
+        self._history_store.async_delay_save(
+            self.history.to_dict, HISTORY_SAVE_DELAY
+        )
+
+    def _record_history(self, face_id: str, event_iso: str) -> None:
+        """Record one appearance into the local date bucket of the event."""
+        try:
+            moment = datetime.fromisoformat(event_iso)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            day = dt_util.as_local(moment).date()
+        except (TypeError, ValueError):
+            moment = dt_util.utcnow()
+            day = dt_util.now().date()
+        self.history.record(
+            face_id, day, moment.astimezone(timezone.utc).isoformat(), at=moment
+        )
+        self._schedule_history_save()
+
+    def _prune_unknown(self) -> bool:
+        """Remove unknown faces older than retention_days."""
+        cutoff = dt_util.utcnow() - timedelta(days=self.retention_days)
+        stale: list[str] = []
+        for face_id, item in self._unknown_faces.items():
+            try:
+                seen = datetime.fromisoformat(str(item.get("last_seen")))
+            except (TypeError, ValueError):
+                continue
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=timezone.utc)
+            if seen < cutoff:
+                stale.append(face_id)
+        for face_id in stale:
+            self._unknown_faces.pop(face_id, None)
+        return bool(stale)
+
+    def _cap_unknown(self) -> bool:
+        """Keep at most max_unknown_faces strangers (drop least recently seen first)."""
+        excess = len(self._unknown_faces) - self.max_unknown_faces
+        if excess <= 0:
+            return False
+        oldest = sorted(
+            self._unknown_faces,
+            key=lambda fid: str(self._unknown_faces[fid].get("last_seen", "")),
+        )[:excess]
+        for face_id in oldest:
+            self._unknown_faces.pop(face_id, None)
+        return True
+
+    def _prune_all(self) -> bool:
+        """Apply retention_days and max_unknown_faces limits."""
+        changed = self.history.prune(self.retention_days, dt_util.now().date())
+        changed |= self._prune_unknown()
+        changed |= self._cap_unknown()
+        return changed
+
+    async def _async_daily_prune(self) -> None:
+        today = dt_util.now().date()
+        if self._last_prune_day == today:
+            return
+        self._last_prune_day = today
+        if self._prune_all():
+            await self._unknown_store.async_save(self._unknown_faces)
+            self._schedule_history_save()
+            if self.data is not None:
+                self.async_update_listeners()
+
+    async def async_flush(self) -> None:
+        """Flush pending unknown faces and history to disk immediately."""
+        await self._unknown_store.async_save(self._unknown_faces)
+        await self._history_store.async_save(self.history.to_dict())
+
+    async def async_merge_face_history(self, old_id: str, new_id: str) -> None:
+        """Merge appearance history when a known person's Face ID is changed."""
+        if self.history.merge(old_id, new_id):
+            self._schedule_history_save()
+
+    async def async_forget_unknown(self, face_id: str) -> bool:
+        """Remove an unknown Face ID from the list and purge its statistics."""
+        face_id = str(face_id)
+        if face_id not in self._unknown_faces:
+            return False
+        self._unknown_faces.pop(face_id)
+        self.history.purge(face_id)
+        await self._unknown_store.async_save(self._unknown_faces)
+        self._schedule_history_save()
+        self.async_update_listeners()
+        return True
+
+    async def async_clear_unknown(self) -> int:
+        """Clear all unknown Face IDs and their statistics."""
+        known = set(self.faces)
+        removed = len(self._unknown_faces)
+        self._unknown_faces = {}
+        self.history.purge_where(lambda face_id: face_id not in known)
+        await self._unknown_store.async_save(self._unknown_faces)
+        self._schedule_history_save()
+        self.async_update_listeners()
+        return removed
+
+    def get_day(self, day: date) -> dict[str, Any]:
+        """Return appearance timeline for the specified day (in HA local timezone)."""
+        return self.history.day_view(
+            self.faces, day, dt_util.get_default_time_zone()
+        )
+
+    def get_stats(self, range_days: int) -> dict[str, Any]:
+        """Return appearance statistics over range_days."""
+        return self.history.stats(self.faces, dt_util.now().date(), range_days)
+
+    async def async_face_map_changed(self) -> None:
+        """Synchronize unknown face list with updated known faces and refresh entities."""
+        known_ids = set(self.faces)
+        removed = self._known_snapshot - known_ids
+        self._known_snapshot = known_ids
+        changed = False
+        for face_id in list(self._unknown_faces):
+            if face_id in known_ids:
+                self._unknown_faces.pop(face_id, None)
+                changed = True
+        for face_id in removed:
+            if face_id in self._unknown_faces:
+                continue
+            summary = self.history.summary(face_id)
+            if summary is None:
+                continue
+            try:
+                first_seen = dt_util.start_of_local_day(
+                    date.fromisoformat(summary["first_day"])
+                ).isoformat()
+            except (TypeError, ValueError):
+                first_seen = dt_util.utcnow().isoformat()
+            self._unknown_faces[face_id] = {
+                "first_seen": first_seen,
+                "last_seen": summary["last_seen"] or first_seen,
+                "count": summary["count"],
+            }
+            changed = True
+        if changed:
+            self._cap_unknown()
+            await self._unknown_store.async_save(self._unknown_faces)
+        self.async_face_map_updated()
+
+    async def async_apply_options(self) -> None:
+        """Apply updated Face mappings, polling, ONVIF, and retention options live."""
+        options = self.entry.options
+
+        self.poll_interval = int(
+            options.get(
+                CONF_POLL_INTERVAL,
+                self.entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
+            )
+        )
+        self.hold_seconds = int(
+            options.get(
+                CONF_HOLD_SECONDS,
+                self.entry.data.get(CONF_HOLD_SECONDS, DEFAULT_HOLD_SECONDS),
+            )
+        )
+        new_enable_onvif = bool(
+            options.get(
+                CONF_ENABLE_ONVIF,
+                self.entry.data.get(CONF_ENABLE_ONVIF, DEFAULT_ENABLE_ONVIF),
+            )
+        )
+        self.history_seconds = int(
+            options.get(CONF_HISTORY_SECONDS, DEFAULT_HISTORY_SECONDS)
+        )
+        self.dedup_seconds = int(
+            options.get(CONF_DEDUP_SECONDS, DEFAULT_DEDUP_SECONDS)
+        )
+        self.update_interval = timedelta(seconds=self.poll_interval)
+        self.stranger_clear_seconds = _clamp(
+            options.get(CONF_STRANGER_CLEAR_SECONDS),
+            DEFAULT_STRANGER_CLEAR_SECONDS,
+            MIN_STRANGER_CLEAR_SECONDS,
+            MAX_STRANGER_CLEAR_SECONDS,
+        )
+        self.retention_days = _clamp(
+            options.get(CONF_RETENTION_DAYS),
+            DEFAULT_RETENTION_DAYS,
+            MIN_RETENTION_DAYS,
+            MAX_RETENTION_DAYS,
+        )
+        self.max_unknown_faces = _clamp(
+            options.get(CONF_MAX_UNKNOWN_FACES),
+            DEFAULT_MAX_UNKNOWN_FACES,
+            MIN_MAX_UNKNOWN_FACES,
+            MAX_MAX_UNKNOWN_FACES,
+        )
+
+        # Start or stop ONVIF listener if toggled
+        if new_enable_onvif != self.enable_onvif:
+            self.enable_onvif = new_enable_onvif
+            if self.enable_onvif:
+                self._stop_onvif.clear()
+                if self._onvif_task is None or self._onvif_task.done():
+                    self._onvif_task = self.entry.async_create_background_task(
+                        self.hass,
+                        self._async_onvif_pullpoint_loop(),
+                        name=f"tapo_local_ai_onvif_{self.host}",
+                    )
+            else:
+                self._stop_onvif.set()
+                if self._onvif_task and not self._onvif_task.done():
+                    self._onvif_task.cancel()
+
+        if self._prune_all():
+            await self._unknown_store.async_save(self._unknown_faces)
+            self._schedule_history_save()
+
+        self.supports_face = infer_face_detection_from_model(self.device_model) or bool(self.faces)
+        await self.async_face_map_changed()
+        await self.async_request_refresh()
+
+    @callback
+    def async_face_map_updated(self) -> None:
+        """Update current face state after mapping changes and notify all entities."""
+        face_id = self._face_current.get(ATTR_FACE_ID)
+        if face_id is not None:
+            name, recognized = self.lookup_face(str(face_id))
+            self._face_current = {
+                **self._face_current,
+                ATTR_NAME: name,
+                ATTR_RECOGNIZED: recognized,
+            }
+        self.async_set_updated_data(self._build_state_snapshot())
+
+    # ---------------- Sensor State Snapshot & ONVIF Push ----------------
 
     def is_sensor_active(self, key: str, now_ts: float | None = None) -> bool:
         """Return True if the given AI sensor is active via ONVIF or within hold_seconds."""
@@ -568,7 +1401,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return (now_ts - last_ts) <= self.hold_seconds
 
     def _build_state_snapshot(self, now_ts: float | None = None) -> dict[str, Any]:
-        """Build state dictionary consumed by entities."""
+        """Build state dictionary consumed by all entities."""
         if now_ts is None:
             now_ts = time.time()
         sensors: dict[str, dict[str, Any]] = {}
@@ -596,6 +1429,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "siren_volume": self.siren_volume,
             "siren_volume_level": self.siren_volume_level,
             "siren_duration": self.siren_duration,
+            "face_current": dict(self._face_current),
         }
 
     @callback
@@ -885,7 +1719,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except asyncio.CancelledError:
             pass
         except Exception as err:
-            _LOGGER.debug("Lỗi tự động tắt còi sau %ds trên %s: %s", delay_seconds, self.host, err)
+            _LOGGER.debug(
+                "Lỗi tự động tắt còi sau %ds trên %s: %s", delay_seconds, self.host, err
+            )
 
     async def async_turn_off_siren(self) -> None:
         """Turn off camera siren immediately."""
@@ -910,7 +1746,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         en_bool = (
             enabled
             if enabled is not None
-            else self._switch_states.get("auto_alarm_switch", cur.get("enabled") == "on")
+            else self._switch_states.get(
+                "auto_alarm_switch", cur.get("enabled") == "on"
+            )
         )
         mode_val = alarm_mode or self.alarm_mode
         vol_str = volume_level_str or self.siren_volume_level
@@ -941,7 +1779,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._raw_sections[("msg_alarm", "chn1_msg_alarm_info")] = payload_info
             return
         except Exception as err1:
-            _LOGGER.debug("setLastAlarmInfo thất bại trên %s (%s), thử setAlarm", self.host, err1)
+            _LOGGER.debug(
+                "setLastAlarmInfo thất bại trên %s (%s), thử setAlarm", self.host, err1
+            )
 
         try:
             tapo.setAlarm(
@@ -1050,7 +1890,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         nv_code = NIGHT_VISION_TO_API.get(option, "inf_night_vision")
         dn_code = NIGHT_VISION_TO_DAYNIGHT.get(option, "auto")
 
-        # 1. Try modern night_vision_mode config in image.switch
         try:
             if hasattr(tapo, "setNightVisionModeConfig"):
                 tapo.setNightVisionModeConfig(nv_code)
@@ -1067,7 +1906,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:
             pass
 
-        # 2. Fallback to classic Day/Night inf_type in image.common
         try:
             tapo.setDayNightMode(dn_code)
             return
@@ -1126,7 +1964,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         api_word = "medium" if word_3 in ("normal", "medium") else word_3
         numeric_str = str(max(1, min(10, level_10)) * 10)
 
-        # Case 1: Motion or Tamper detection with both sensitivity and digital_sensitivity
         if spec.has_digital_sensitivity:
             payload = {
                 spec.module: {
@@ -1141,7 +1978,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 tapo.executeFunction(spec.set_method, payload)
                 return
             except Exception:
-                # Fallback without digital_sensitivity if camera only supports 3-level word
                 tapo.executeFunction(
                     spec.set_method,
                     {
@@ -1155,7 +1991,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
 
-        # Case 2: AI visual / sound detection modules
         fmt = self._sensitivity_format.get(spec.key, spec.default_format)
         primary_val = api_word if fmt == "word" else numeric_str
         fallback_val = numeric_str if fmt == "word" else api_word
@@ -1239,7 +2074,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if new_switches:
                 self._switch_states.update(new_switches)
         except Exception as sw_err:
-            _LOGGER.debug("Lỗi làm mới trạng thái switch trên %s: %s", self.host, sw_err)
+            _LOGGER.debug(
+                "Lỗi làm mới trạng thái switch trên %s: %s", self.host, sw_err
+            )
 
         if self.supports_ptz and (self._poll_counter % 5 == 0):
             try:
@@ -1347,7 +2184,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Parse switches, sensitivities, image modes, audio volumes, and alarm config from cached sections."""
         states: dict[str, bool] = {}
 
-        # 1. Switches
         for sw in AI_DETECTION_SWITCHES:
             if sw.ptz_only and not self.supports_ptz:
                 continue
@@ -1359,7 +2195,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else:
                     states[sw.key] = raw_v == sw.on_value.lower()
 
-        # 2. Sensitivities (1-10 and 3-level)
         for sp in AI_SENSITIVITY_SPECS:
             sec_data = self._raw_sections.get((sp.module, sp.section))
             if not isinstance(sec_data, dict):
@@ -1403,7 +2238,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if not has_dig:
                             self._sensitivity_10[sp.key] = word_to_level10(w_norm)
 
-        # 3. Night Vision & Light Frequency
         img_switch = self._raw_sections.get(("image", "switch"), {})
         img_common = self._raw_sections.get(("image", "common"), {})
         nv_raw = img_switch.get("night_vision_mode") or img_common.get("inf_type")
@@ -1414,7 +2248,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if lf_raw and str(lf_raw) in LIGHT_FREQUENCY_FROM_API:
             self.light_frequency = LIGHT_FREQUENCY_FROM_API[str(lf_raw)]
 
-        # 4. Audio Volumes (Speaker & Microphone)
         spk_sec = self._raw_sections.get(("audio_config", "speaker"), {})
         if "volume" in spk_sec:
             try:
@@ -1425,11 +2258,12 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         mic_sec = self._raw_sections.get(("audio_config", "microphone"), {})
         if "volume" in mic_sec:
             try:
-                self.microphone_volume = max(0, min(100, int(float(mic_sec["volume"]))))
+                self.microphone_volume = max(
+                    0, min(100, int(float(mic_sec["volume"])))
+                )
             except (ValueError, TypeError):
                 pass
 
-        # 5. Siren / Alarm Config
         alarm_sec = self._raw_sections.get(("msg_alarm", "chn1_msg_alarm_info"), {})
         if alarm_sec:
             modes = alarm_sec.get("alarm_mode")
@@ -1441,9 +2275,15 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else:
                     self.alarm_mode = "sound"
 
-            vol_raw = str(
-                alarm_sec.get("alarm_volume") or alarm_sec.get("siren_volume") or ""
-            ).strip().lower()
+            vol_raw = (
+                str(
+                    alarm_sec.get("alarm_volume")
+                    or alarm_sec.get("siren_volume")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
             if vol_raw:
                 if vol_raw.isdigit():
                     v_10 = max(1, min(10, int(vol_raw)))
@@ -1454,7 +2294,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 elif vol_raw in ("low", "normal", "medium", "high"):
                     lvl = "normal" if vol_raw in ("normal", "medium") else vol_raw
                     self.siren_volume_level = lvl
-                    self.siren_volume = 3 if lvl == "low" else (6 if lvl == "normal" else 10)
+                    self.siren_volume = (
+                        3 if lvl == "low" else (6 if lvl == "normal" else 10)
+                    )
 
             dur_raw = (
                 alarm_sec.get("alarm_duration")
@@ -1523,7 +2365,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     batch_err,
                 )
 
-        # Fallback: query each item individually and prune unsupported methods
         for req in req_list:
             m_name = req["method"]
             try:
@@ -1545,14 +2386,15 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if new_states:
                     self._switch_states.update(new_states)
         except Exception as err:
-            _LOGGER.debug("Không thể đọc trạng thái switch AI trên %s: %s", self.host, err)
+            _LOGGER.debug(
+                "Không thể đọc trạng thái switch AI trên %s: %s", self.host, err
+            )
 
     def _set_switch_sync(self, spec: TapoAISwitchSpec, enabled: bool) -> None:
         """Enable or disable a specific AI detection, image processing, or hardware module on the camera."""
         tapo = self._ensure_tapo_sync()
         target_val = spec.on_value if enabled else spec.off_value
 
-        # Special handling for Image Flip
         if spec.key == "flip":
             try:
                 tapo.setImageFlipVertical(enabled)
@@ -1572,7 +2414,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
 
-        # Special handling for Lens Distortion Correction (LDC)
         if spec.key == "lens_distortion":
             try:
                 tapo.setLensDistortionCorrection(enabled)
@@ -1585,7 +2426,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return
 
-        # Special handling for Record to SD Card (preserve weekly schedule)
         if spec.key == "record_to_sd":
             cur_plan = dict(
                 self._raw_sections.get(("record_plan", "chn1_channel"), {})
@@ -1612,7 +2452,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._raw_sections[("record_plan", "chn1_channel")] = cur_plan
             return
 
-        # Special handling for Microphone Mute
         if spec.key == "microphone_mute":
             try:
                 tapo.executeFunction(
@@ -1631,12 +2470,10 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
 
-        # Special handling for Auto Alarm switch
         if spec.key == "auto_alarm_switch":
             self._apply_alarm_config_sync(enabled=enabled)
             return
 
-        # Standard AI detection & control switches
         payload = {
             spec.set_module: {
                 spec.set_section: {
@@ -1649,6 +2486,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_set_ai_switch(self, spec: TapoAISwitchSpec, enabled: bool) -> None:
         """Set an AI detection or hardware switch state and update coordinator data."""
         async with self._api_lock:
-            await self.hass.async_add_executor_job(self._set_switch_sync, spec, enabled)
+            await self.hass.async_add_executor_job(
+                self._set_switch_sync, spec, enabled
+            )
         self._switch_states[spec.key] = enabled
         self.async_set_updated_data(self._build_state_snapshot())

@@ -1,17 +1,21 @@
-"""Binary sensor platform for Tapo Camera Local AI detections (Baby Cry, Dog Bark, etc.)."""
+"""Binary sensor platform for Tapo Camera Local AI detections & Face Recognition."""
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import AI_BINARY_SENSORS, DOMAIN, TapoAIBinarySensorSpec
+from .const import AI_BINARY_SENSORS, ATTR_RECOGNIZED, DOMAIN, TapoAIBinarySensorSpec
 from .coordinator import TapoLocalAICoordinator
+from .entity import TapoC260Entity, TapoC260HealthEntity
 
 
 async def async_setup_entry(
@@ -19,12 +23,20 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Tapo AI detection binary sensors from a config entry."""
+    """Set up Tapo AI detection and Face Recognition binary sensors from a config entry."""
     coordinator: TapoLocalAICoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities = [
+    entities: list[BinarySensorEntity] = [
         TapoAIBinarySensor(coordinator, spec)
         for spec in AI_BINARY_SENSORS
     ]
+    entities.append(TapoC260ConnectionBinarySensor(coordinator))
+    if coordinator.supports_face:
+        entities.extend(
+            [
+                TapoC260RecognizedBinarySensor(coordinator),
+                TapoC260StrangerBinarySensor(coordinator),
+            ]
+        )
     async_add_entities(entities)
 
 
@@ -83,3 +95,69 @@ class TapoAIBinarySensor(CoordinatorEntity[TapoLocalAICoordinator], BinarySensor
             if field in sensor_data:
                 attrs[field] = sensor_data[field]
         return attrs
+
+
+class TapoC260RecognizedBinarySensor(TapoC260Entity, BinarySensorEntity):
+    """Whether the current detected Face ID is a configured known person."""
+
+    _attr_icon = "mdi:face-recognition"
+    _attr_name = "Nhận diện người quen (Face Recognized)"
+
+    def __init__(self, coordinator: TapoLocalAICoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_face_recognized"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.coordinator.current.get(ATTR_RECOGNIZED, False))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return dict(self.coordinator.current)
+
+
+class TapoC260StrangerBinarySensor(TapoC260Entity, BinarySensorEntity):
+    """On when an unknown face is detected; auto-clears after stranger_clear_seconds."""
+
+    _attr_icon = "mdi:account-alert"
+    _attr_name = "Phát hiện người lạ (Stranger Detected)"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+
+    def __init__(self, coordinator: TapoLocalAICoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_stranger_detected"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.stranger_active
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "clear_after_seconds": self.coordinator.stranger_clear_seconds,
+            **self.coordinator.current,
+        }
+
+
+class TapoC260ConnectionBinarySensor(TapoC260HealthEntity, BinarySensorEntity):
+    """On when recent camera polling succeeded; Off when disconnected."""
+
+    _attr_name = "Kết nối Camera (Camera Connection)"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, coordinator: TapoLocalAICoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_connection"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.coordinator.health()["connected"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        health = self.coordinator.health()
+        return {
+            "status": health["status"],
+            "last_error": health["last_error"],
+            "consecutive_failures": health["consecutive_failures"],
+        }
