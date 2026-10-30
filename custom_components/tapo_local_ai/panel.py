@@ -6,15 +6,17 @@ from pathlib import Path
 
 from homeassistant.components import frontend, panel_custom
 from homeassistant.components.http import StaticPathConfig
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_FACES,
     CONF_SHOW_SIDEBAR,
     CONF_SIDEBAR_TITLE,
     DEFAULT_SHOW_SIDEBAR,
     DEFAULT_SIDEBAR_TITLE,
     DOMAIN,
+    FACE_MODEL_KEYWORDS,
 )
 
 PANEL_PATH = f"/{DOMAIN}_manager"
@@ -39,6 +41,19 @@ _ACTIVE_STATES = (
 )
 
 
+def entry_supports_face(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Return True if the config entry belongs to a camera that supports Face Recognition."""
+    coord = getattr(entry, "runtime_data", None) or hass.data.get(DOMAIN, {}).get(
+        entry.entry_id
+    )
+    if coord is not None and hasattr(coord, "supports_face"):
+        return bool(coord.supports_face)
+    if entry.options.get(CONF_FACES):
+        return True
+    title_up = (entry.title or "").upper()
+    return any(kw in title_up for kw in FACE_MODEL_KEYWORDS)
+
+
 def has_active_entries(hass: HomeAssistant, exclude_entry_id: str | None = None) -> bool:
     """Return True if any camera entry (other than exclude_entry_id) is active."""
     return any(
@@ -48,26 +63,26 @@ def has_active_entries(hass: HomeAssistant, exclude_entry_id: str | None = None)
 
 
 def _sidebar_wanted(hass: HomeAssistant, exclude_entry_id: str | None = None) -> bool:
-    """Show panel in sidebar if ANY active camera entry supports Face AI and has show_sidebar enabled."""
+    """Show panel in sidebar ONLY if at least one active camera supports Face AI and has show_sidebar enabled."""
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry.entry_id == exclude_entry_id or entry.state not in _ACTIVE_STATES:
             continue
         if not entry.options.get(CONF_SHOW_SIDEBAR, DEFAULT_SHOW_SIDEBAR):
             continue
-        coord = getattr(entry, "runtime_data", None) or hass.data.get(DOMAIN, {}).get(entry.entry_id)
-        # If coordinator is loaded and supports face (or not yet loaded/has faces configured)
-        if coord is None or getattr(coord, "supports_face", False) or bool(entry.options.get(CONF_FACES)):
+        if entry_supports_face(hass, entry):
             return True
     return False
 
 
 def _sidebar_title(hass: HomeAssistant, exclude_entry_id: str | None = None) -> str:
-    """Sidebar title: taken from the first active camera (by title) with custom title set."""
+    """Sidebar title: taken from the first active face-capable camera (by title) with custom title set."""
     entries = sorted(
         (
             entry
             for entry in hass.config_entries.async_entries(DOMAIN)
-            if entry.entry_id != exclude_entry_id and entry.state in _ACTIVE_STATES
+            if entry.entry_id != exclude_entry_id
+            and entry.state in _ACTIVE_STATES
+            and entry_supports_face(hass, entry)
         ),
         key=lambda entry: (entry.title, entry.entry_id),
     )
@@ -97,6 +112,10 @@ async def _async_sync_panel_locked(
     data = hass.data.setdefault(DOMAIN, {})
     show = _sidebar_wanted(hass, exclude_entry_id)
     title = _sidebar_title(hass, exclude_entry_id)
+
+    # If no camera wants the panel and it was never registered, do nothing
+    if not show and not data.get("panel_registered"):
+        return
 
     if (
         data.get("panel_registered")

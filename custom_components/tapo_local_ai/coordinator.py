@@ -94,6 +94,10 @@ _LOGGER = logging.getLogger(__name__)
 
 PULLPOINT_NS = "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription"
 HISTORY_SAVE_DELAY = 30
+CORE_PROTECTED_METHODS = frozenset(
+    {"getLensMaskConfig", "getLedStatus", "getDetectionConfig"}
+)
+UNSUPPORTED_ERROR_CODES = frozenset({-40209, -40210, -40106, -10002})
 
 
 def _clamp(value: Any, default: int, low: int, high: int) -> int:
@@ -129,28 +133,39 @@ def connect_tapo_multi_auth(
     password: str,
     cloud_password: str = "",
     control_port: int = DEFAULT_CONTROL_PORT,
+    preferred_auth: tuple[str, str, str, str] | None = None,
 ) -> tuple[Tapo, dict[str, Any]]:
-    """Try connecting to Tapo control API (port 443) using all valid credential combinations."""
+    """Try connecting to Tapo control API (port 443) using valid credential combinations.
+
+    When preferred_auth is provided (reconnect scenario), only that proven credential tuple
+    is used so that transient network glitches never trigger failed-login attempts or
+    the 5-minute (-40404) brute-force IP lockout on cameras like Tapo C125.
+    """
     candidates: list[tuple[str, str, str, str]] = []
 
-    clean_user = (username or "").strip()
-    clean_pass = password or ""
-    clean_cloud = (cloud_password or "").strip()
+    if preferred_auth is not None:
+        candidates.append(preferred_auth)
+    else:
+        clean_user = (username or "").strip()
+        clean_pass = password or ""
+        clean_cloud = (cloud_password or "").strip()
 
-    if clean_cloud:
-        candidates.append(("admin + cloud_password", "admin", clean_cloud, clean_cloud))
+        if clean_cloud:
+            candidates.append(
+                ("admin + cloud_password", "admin", clean_cloud, clean_cloud)
+            )
 
-    if clean_user:
-        candidates.append(("camera_account_only", clean_user, clean_pass, ""))
+        if clean_user:
+            candidates.append(("camera_account_only", clean_user, clean_pass, ""))
 
-    candidates.append(
-        ("admin + camera_password", "admin", clean_pass, clean_cloud or clean_pass)
-    )
-
-    if clean_cloud and clean_user and clean_user.lower() != "admin":
         candidates.append(
-            ("camera_account + cloud_password", clean_user, clean_pass, clean_cloud)
+            ("admin + camera_password", "admin", clean_pass, clean_cloud or clean_pass)
         )
+
+        if clean_cloud and clean_user and clean_user.lower() != "admin":
+            candidates.append(
+                ("camera_account + cloud_password", clean_user, clean_pass, clean_cloud)
+            )
 
     last_err: Exception | None = None
     seen: set[tuple[str, str, str]] = set()
@@ -171,6 +186,7 @@ def connect_tapo_multi_auth(
                 printWarnInformation=False,
             )
             basic_info = getattr(tapo, "basicInfo", None) or tapo.getBasicInfo()
+            setattr(tapo, "_winning_auth", (label, u, p, cp))
             _LOGGER.info(
                 "Đã xác thực thành công API điều khiển Tapo %s:%s bằng phương thức [%s]",
                 host,
@@ -220,11 +236,12 @@ def parse_tapo_basic_info(basic_raw: dict[str, Any], host: str) -> dict[str, str
     }
 
 
-
-def infer_face_detection_from_model(model: str) -> bool:
+def infer_face_detection_from_model(
+    model: str, title: str = "", username: str = ""
+) -> bool:
     """Infer whether the camera hardware supports on-device Face Recognition."""
-    m = model.upper()
-    return any(kw in m for kw in FACE_MODEL_KEYWORDS)
+    combined = f"{model} {title} {username}".upper()
+    return any(kw in combined for kw in FACE_MODEL_KEYWORDS)
 
 
 def infer_ptz_from_model_or_user(
@@ -338,6 +355,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         self.tapo: Tapo | None = None
+        self._working_auth: tuple[str, str, str, str] | None = None
         # Built-in C260 direct securePassthrough fallback client
         self.api = TapoC260Api(
             async_get_clientsession(hass),
@@ -357,7 +375,12 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # PTZ capability & state
         self.supports_ptz: bool = False
-        self.supports_face: bool = infer_face_detection_from_model(self.device_model) or bool(self.faces)
+        self.supports_face: bool = (
+            infer_face_detection_from_model(
+                self.device_model, self.device_name, self.username
+            )
+            or bool(self.faces)
+        )
         self.ptz_step_angle: int = DEFAULT_PTZ_STEP_ANGLE
         self.presets: dict[str, str] = {}
         self.patrol_mode: str = "Off"
@@ -389,6 +412,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Raw section cache for safe read-modify-write operations
         self._raw_sections: dict[tuple[str, str], dict[str, Any]] = {}
         self._unsupported_batch_methods: set[str] = set()
+        self._confirmed_supported_methods: set[str] = set()
+        self._method_fail_counts: dict[str, int] = {}
+        self._force_full_config_sync: bool = True
 
         # Track active sensor state and last trigger timestamps
         self._last_triggered_ts: dict[str, float] = {
@@ -442,7 +468,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Backoff tracking for port 443 control API
         self._last_connect_attempt_ts: float = 0.0
-        self._connect_retry_cooldown: float = 60.0
+        self._connect_retry_cooldown: float = 15.0
 
         # ONVIF background task handle
         self._onvif_task: asyncio.Task | None = None
@@ -545,17 +571,52 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ---------------- Setup & Shutdown ----------------
 
     def _connect_tapo_sync(self) -> dict[str, Any]:
-        """Connect to Tapo camera synchronously in executor using multi-auth fallback."""
+        """Connect to Tapo camera synchronously in executor using cached auth first."""
         self._last_connect_attempt_ts = time.monotonic()
-        tapo, basic_info = connect_tapo_multi_auth(
-            self.host,
-            self.username,
-            self.password,
-            self.cloud_password,
-            self.control_port,
-        )
+
+        # First try refreshing existing session token if a Tapo client already exists
+        if self.tapo is not None:
+            try:
+                if hasattr(self.tapo, "refreshStok"):
+                    self.tapo.refreshStok()
+                    basic_info = (
+                        getattr(self.tapo, "basicInfo", None)
+                        or self.tapo.getBasicInfo()
+                    )
+                    self._connect_retry_cooldown = 15.0
+                    return basic_info if isinstance(basic_info, dict) else {}
+            except Exception as refresh_err:
+                err_str = str(refresh_err).lower()
+                if "suspension" in err_str or "-40404" in err_str:
+                    self._connect_retry_cooldown = 305.0
+                    self.tapo = None
+                    raise
+                self.tapo = None
+
+        try:
+            tapo, basic_info = connect_tapo_multi_auth(
+                self.host,
+                self.username,
+                self.password,
+                self.cloud_password,
+                self.control_port,
+                preferred_auth=self._working_auth,
+            )
+        except Exception as err:
+            err_str = str(err).lower()
+            if "suspension" in err_str or "-40404" in err_str:
+                self._connect_retry_cooldown = 305.0
+            else:
+                self._connect_retry_cooldown = 15.0
+            raise
+
+        winning = getattr(tapo, "_winning_auth", None)
+        if winning is not None:
+            self._working_auth = winning
+        self._connect_retry_cooldown = 15.0
         self.tapo = tapo
         self.api.shared_controller = tapo
+        self._force_full_config_sync = True
         return basic_info
 
     def _detect_ptz_and_presets_sync(self) -> tuple[bool, dict[str, str]]:
@@ -567,6 +628,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.tapo is None:
             return bool(inferred), {}
 
+        if inferred is False:
+            return False, {}
+
         raw_presets = getattr(self.tapo, "presets", None)
         if raw_presets is None or raw_presets == {}:
             try:
@@ -576,8 +640,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if raw_presets is not False and isinstance(raw_presets, dict):
             parsed_presets = {str(k): str(v) for k, v in raw_presets.items()}
-            if inferred is False and not parsed_presets:
-                return False, {}
             return True, parsed_presets
 
         try:
@@ -624,20 +686,72 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.firmware_version = meta["sw_version"]
             self.serial_number = meta["serial"]
             self._mode = "standalone"
-            self.supports_face = infer_face_detection_from_model(self.device_model) or bool(self.faces)
+            self.supports_face = (
+                infer_face_detection_from_model(
+                    self.device_model, self.device_name, self.username
+                )
+                or bool(self.faces)
+            )
         except Exception as err:
             _LOGGER.warning(
                 "API điều khiển cổng %s trên %s chưa phản hồi qua pytapo (%s). "
-                "Thử kết nối dự phòng C260 Secure Channel / RTSP / ONVIF.",
+                "Kiểm tra kết nối dự phòng C260 Secure Channel / RTSP / ONVIF.",
                 self.control_port,
                 self.host,
                 err,
             )
-            try:
-                await self.api.async_login()
-                self._mode = "standalone"
-            except Exception as c260_err:
-                _LOGGER.debug("C260 fallback login trên %s chưa sẵn sàng: %s", self.host, c260_err)
+            inferred_fixed = infer_ptz_from_model_or_user(
+                self.device_model, self.username, self.device_name
+            )
+            # Only attempt C260 direct login if this entry could be a C260/Face camera
+            if self.supports_face or inferred_fixed is None:
+                try:
+                    await self.api.async_login()
+                    self._mode = "standalone"
+                    if self.device_model == "Tapo Camera":
+                        self.device_model = "Tapo C260"
+                    try:
+                        dev_resp = await self.api.async_secure_request(
+                            {
+                                "method": "multipleRequest",
+                                "params": {
+                                    "requests": [
+                                        {
+                                            "method": "getDeviceInfo",
+                                            "params": {
+                                                "device_info": {"name": ["basic_info"]}
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        )
+                        basic_raw = (
+                            dev_resp.get("result", {})
+                            .get("responses", [{}])[0]
+                            .get("result", {})
+                        )
+                        if isinstance(basic_raw, dict) and basic_raw:
+                            meta = parse_tapo_basic_info(basic_raw, self.host)
+                            self.device_model = meta["model"]
+                            self.device_name = meta["alias"]
+                            self.device_mac = meta["mac"]
+                            self.firmware_version = meta["sw_version"]
+                            self.serial_number = meta["serial"]
+                    except Exception:
+                        pass
+                    self.supports_face = (
+                        infer_face_detection_from_model(
+                            self.device_model, self.device_name, self.username
+                        )
+                        or bool(self.faces)
+                    )
+                except Exception as c260_err:
+                    _LOGGER.debug(
+                        "C260 fallback login trên %s chưa sẵn sàng: %s",
+                        self.host,
+                        c260_err,
+                    )
 
         # 3. Detect PTZ capability & presets
         try:
@@ -645,10 +759,11 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._detect_ptz_and_presets_sync
             )
             _LOGGER.info(
-                "Camera %s (%s): hỗ trợ PTZ = %s, số điểm nhớ Preset = %d",
+                "Camera %s (%s): hỗ trợ PTZ = %s, hỗ trợ Face AI = %s, số điểm nhớ Preset = %d",
                 self.device_name,
                 self.device_model,
                 self.supports_ptz,
+                self.supports_face,
                 len(self.presets),
             )
         except Exception as ptz_err:
@@ -700,7 +815,11 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     candidates.append(playback)
                 responses = result.get("responses")
                 if isinstance(responses, list) and responses:
-                    first_res = responses[0].get("result", {}) if isinstance(responses[0], dict) else {}
+                    first_res = (
+                        responses[0].get("result", {})
+                        if isinstance(responses[0], dict)
+                        else {}
+                    )
                     if isinstance(first_res, dict):
                         candidates.append(first_res)
                         pb2 = first_res.get("playback")
@@ -722,7 +841,11 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return None
 
     def _poll_camera_events_sync(self) -> list[dict[str, Any]]:
-        """Query local searchDetectionList preserving both AI alarm_type/events_1 and C260 event_info (face_id)."""
+        """Query local detection events efficiently without redundant calls on idle polls."""
+        # When Privacy Mode (lens mask) is active, the camera shutter is closed and AI detection is paused
+        if self._switch_states.get("privacy_mode_switch", False):
+            return []
+
         if self.tapo is None:
             if (
                 time.monotonic() - self._last_connect_attempt_ts
@@ -731,7 +854,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._connect_tapo_sync()
             try:
                 self.supports_ptz, self.presets = self._detect_ptz_and_presets_sync()
-                self._switch_states.update(self._read_switches_sync())
+                self._switch_states.update(self._read_switches_sync(full_sync=True))
             except Exception:
                 pass
 
@@ -739,7 +862,24 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now_ts = int(time.time())
         window = max(90, int(self.history_seconds), int(self.hold_seconds) * 2)
 
-        # 1. Direct searchDetectionList with UTC timestamps (used by Tapo C260 and modern FW; preserves event_info.face_id)
+        # For non-Face cameras (e.g. C125, C225, C210, C320WS), pytapo.getEvents() caches timeCorrection
+        # internally and performs a single lightweight request, returning [] when idle.
+        if not self.supports_face:
+            try:
+                events = self.tapo.getEvents(
+                    startTime=now_ts - window, endTime=now_ts + 15
+                )
+                if isinstance(events, list):
+                    return events
+            except Exception as err:
+                _LOGGER.debug(
+                    "getEvents() trên %s trả về lỗi (%s), thử searchDetectionList trực tiếp",
+                    self.host,
+                    err,
+                )
+
+        # Direct searchDetectionList with UTC timestamps (used by Tapo C260 to preserve event_info.face_id,
+        # and as fallback for cameras whose firmware does not support getTimeCorrection)
         try:
             raw = self.tapo.executeFunction(
                 "searchDetectionList",
@@ -756,8 +896,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 },
             )
             direct_events = self._extract_events_from_response(raw)
-            if isinstance(direct_events, list) and direct_events:
-                # Check if timestamps are already close to UTC epoch now_ts
+            if isinstance(direct_events, list):
+                if not direct_events:
+                    return []
                 sample_ts = int(direct_events[0].get("start_time") or now_ts)
                 if sample_ts > 10_000_000_000:
                     sample_ts = int(sample_ts / 1000)
@@ -765,24 +906,14 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return direct_events
         except Exception as err:
             _LOGGER.debug(
-                "searchDetectionList trực tiếp trên %s trả về lỗi (%s), thử qua getEvents()",
+                "searchDetectionList trực tiếp trên %s trả về lỗi (%s)",
                 self.host,
                 err,
             )
+            if not self.supports_face:
+                raise
 
-        # 2. Try pytapo.getEvents() (handles cameras whose internal clock requires timeCorrection)
-        try:
-            events = self.tapo.getEvents(startTime=now_ts - window, endTime=now_ts + 15)
-            if isinstance(events, list):
-                return events
-        except Exception as err:
-            _LOGGER.debug(
-                "getEvents() trên %s trả về lỗi (%s), thử searchDetectionList có bù múi giờ",
-                self.host,
-                err,
-            )
-
-        # 3. Fallback with explicit timeCorrection
+        # Fallback with explicit timeCorrection for Face cameras whose clock is in local time
         time_corr = 0
         try:
             tc = self.tapo.getTimeCorrection()
@@ -790,6 +921,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 time_corr = int(tc)
         except Exception:
             time_corr = 0
+
+        if time_corr == 0:
+            return []
 
         cam_now = now_ts - time_corr
         raw_tc = self.tapo.executeFunction(
@@ -831,13 +965,18 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 poll_ok = True
                 self._mode = "standalone"
         except Exception as err:
-            # Try C260 direct async client if pytapo session failed
-            try:
-                window = max(90, int(self.history_seconds), int(self.hold_seconds) * 2)
-                events = await self.api.async_search_detection_list(window)
-                poll_ok = True
-                self._mode = "standalone"
-            except Exception:
+            # Only try C260 direct async client if this is a Face camera without a pytapo session
+            if self.supports_face and self.tapo is None:
+                try:
+                    window = max(
+                        90, int(self.history_seconds), int(self.hold_seconds) * 2
+                    )
+                    events = await self.api.async_search_detection_list(window)
+                    poll_ok = True
+                    self._mode = "standalone"
+                except Exception:
+                    self._record_poll_failure(err)
+            else:
                 self._record_poll_failure(err)
                 _LOGGER.debug(
                     "Bỏ qua lỗi tạm thời khi quét trạng thái & sự kiện trên %s: %s",
@@ -915,7 +1054,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
 
         # 2. Process C260 Face Recognition events (event_info -> face_id)
-        if poll_ok:
+        if poll_ok and self.supports_face:
             await self._async_process_face_events(events)
 
         return self._build_state_snapshot(now_ts)
@@ -1372,7 +1511,12 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._unknown_store.async_save(self._unknown_faces)
             self._schedule_history_save()
 
-        self.supports_face = infer_face_detection_from_model(self.device_model) or bool(self.faces)
+        self.supports_face = (
+            infer_face_detection_from_model(
+                self.device_model, self.device_name, self.username
+            )
+            or bool(self.faces)
+        )
         await self.async_face_map_changed()
         await self.async_request_refresh()
 
@@ -1586,6 +1730,10 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _ensure_tapo_sync(self) -> Tapo:
         """Ensure self.tapo is connected in executor."""
         if self.tapo is None:
+            if (
+                time.monotonic() - self._last_connect_attempt_ts
+            ) < self._connect_retry_cooldown:
+                raise RuntimeError("Đang trong thời gian chờ kết nối lại cổng 443")
             self._connect_tapo_sync()
         assert self.tapo is not None
         return self.tapo
@@ -2068,17 +2216,34 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _poll_camera_state_and_events_sync(self) -> list[dict[str, Any]]:
         """Poll both device states (real-time sync with Tapo app) and local AI detection events."""
         self._poll_counter += 1
+        do_full_sync = (
+            self._force_full_config_sync
+            or not self._switch_states
+            or (self._poll_counter % 3 == 1)
+        )
 
         try:
-            new_switches = self._read_switches_sync()
+            new_switches = self._read_switches_sync(full_sync=do_full_sync)
             if new_switches:
                 self._switch_states.update(new_switches)
         except Exception as sw_err:
+            err_str = str(sw_err).lower()
+            if (
+                "401" in err_str
+                or "-40401" in err_str
+                or "stok" in err_str
+                or "session" in err_str
+            ):
+                self.tapo = None
             _LOGGER.debug(
                 "Lỗi làm mới trạng thái switch trên %s: %s", self.host, sw_err
             )
 
-        if self.supports_ptz and (self._poll_counter % 5 == 0):
+        if (
+            self.supports_ptz
+            and not self._switch_states.get("privacy_mode_switch", False)
+            and (self._poll_counter % 10 == 0)
+        ):
             try:
                 _, latest_presets = self._detect_ptz_and_presets_sync()
                 if latest_presets:
@@ -2087,6 +2252,58 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 pass
 
         return self._poll_camera_events_sync()
+
+    def _read_privacy_mode_sync(self, tapo: Tapo) -> bool | None:
+        """Read Privacy Mode (lens_mask) directly so physical shutter / Tapo app changes sync reliably on C125 & all models."""
+        is_privacy: bool | None = None
+        try:
+            res = tapo.executeFunction(
+                "getLensMaskConfig",
+                {"lens_mask": {"name": ["lens_mask_info"]}},
+            )
+            if isinstance(res, dict):
+                self._ingest_result_body(res)
+                lm_info = (
+                    res.get("lens_mask", {}).get("lens_mask_info")
+                    or res.get("lens_mask_info")
+                    or self._raw_sections.get(("lens_mask", "lens_mask_info"))
+                )
+                if isinstance(lm_info, dict) and "enabled" in lm_info:
+                    is_privacy = str(lm_info["enabled"]).strip().lower() in (
+                        "on",
+                        "true",
+                        "1",
+                    )
+        except Exception:
+            pass
+
+        if is_privacy is None:
+            try:
+                pm = tapo.getPrivacyMode()
+                if isinstance(pm, dict) and "enabled" in pm:
+                    is_privacy = str(pm["enabled"]).strip().lower() in (
+                        "on",
+                        "true",
+                        "1",
+                    )
+                elif isinstance(pm, bool):
+                    is_privacy = pm
+            except Exception:
+                pass
+
+        if is_privacy is not None:
+            self._confirmed_supported_methods.add("getLensMaskConfig")
+            self._unsupported_batch_methods.discard("getLensMaskConfig")
+            prev_privacy = self._switch_states.get("privacy_mode_switch")
+            self._raw_sections[("lens_mask", "lens_mask_info")] = {
+                "enabled": "on" if is_privacy else "off"
+            }
+            self._switch_states["privacy_mode_switch"] = is_privacy
+            if prev_privacy is True and is_privacy is False:
+                # Camera just exited Privacy Mode -> force full sync of AI & image settings
+                self._force_full_config_sync = True
+
+        return is_privacy
 
     def _build_batch_requests(self) -> list[dict[str, Any]]:
         """Build deduplicated list of get* sub-requests for multipleRequest."""
@@ -2313,9 +2530,43 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return states
 
-    def _read_switches_sync(self) -> dict[str, bool]:
-        """Read all switches, sensitivities, image settings, and audio/siren configs in 1 batched multipleRequest."""
+    def _record_method_outcome(
+        self, method_name: str, err_code: int, privacy_active: bool
+    ) -> None:
+        """Track supported vs unsupported batch methods without ever blacklisting methods during Privacy Mode."""
+        if not method_name:
+            return
+        if err_code == 0:
+            self._confirmed_supported_methods.add(method_name)
+            self._unsupported_batch_methods.discard(method_name)
+            self._method_fail_counts.pop(method_name, None)
+            return
+
+        if (
+            privacy_active
+            or method_name in CORE_PROTECTED_METHODS
+            or method_name in self._confirmed_supported_methods
+        ):
+            return
+
+        if err_code in UNSUPPORTED_ERROR_CODES:
+            fails = self._method_fail_counts.get(method_name, 0) + 1
+            self._method_fail_counts[method_name] = fails
+            if fails >= 2:
+                self._unsupported_batch_methods.add(method_name)
+
+    def _read_switches_sync(self, full_sync: bool = True) -> dict[str, bool]:
+        """Read Privacy Mode on every cycle and full switches/sensitivities/audio on full_sync cycles."""
         tapo = self._ensure_tapo_sync()
+
+        # 1. Always read Privacy Mode (getLensMaskConfig) first
+        is_privacy = self._read_privacy_mode_sync(tapo)
+
+        # If Privacy Mode is ON (physical shutter closed on C125/C225) or this is a lightweight fast-sync cycle,
+        # return updated states immediately without hammering disabled AI/image modules.
+        if is_privacy is True or not (full_sync or self._force_full_config_sync):
+            return self._extract_states_from_raw_sections()
+
         req_list = self._build_batch_requests()
 
         if req_list:
@@ -2340,21 +2591,26 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     resp_items = raw_resp
 
                 if isinstance(resp_items, list) and resp_items:
+                    # Check if lens_mask inside batch indicates privacy mode is active
+                    batch_privacy = bool(is_privacy)
                     for idx, item in enumerate(resp_items):
                         if not isinstance(item, dict):
                             continue
-                        err_code = item.get("error_code", 0)
+                        err_code = int(item.get("error_code", 0) or 0)
                         method_name = item.get("method") or (
                             req_list[idx]["method"] if idx < len(req_list) else ""
                         )
                         if err_code != 0:
-                            if method_name:
-                                self._unsupported_batch_methods.add(method_name)
+                            self._record_method_outcome(
+                                method_name, err_code, batch_privacy
+                            )
                             continue
+                        self._record_method_outcome(method_name, 0, batch_privacy)
                         res_body = item.get("result", item)
                         if isinstance(res_body, dict):
                             self._ingest_result_body(res_body)
 
+                    self._force_full_config_sync = False
                     states = self._extract_states_from_raw_sections()
                     if states:
                         return states
@@ -2365,14 +2621,25 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     batch_err,
                 )
 
-        for req in req_list:
-            m_name = req["method"]
-            try:
-                res = tapo.executeFunction(m_name, req["params"])
-                if isinstance(res, dict):
-                    self._ingest_result_body(res)
-            except Exception:
-                self._unsupported_batch_methods.add(m_name)
+        # Fallback: query individual modules only if Privacy Mode is OFF
+        if not self._switch_states.get("privacy_mode_switch", False):
+            for req in req_list:
+                m_name = req["method"]
+                if m_name == "getLensMaskConfig" and is_privacy is not None:
+                    continue
+                try:
+                    res = tapo.executeFunction(m_name, req["params"])
+                    if isinstance(res, dict):
+                        self._record_method_outcome(m_name, 0, False)
+                        self._ingest_result_body(res)
+                except Exception as single_err:
+                    err_s = str(single_err)
+                    for code in UNSUPPORTED_ERROR_CODES:
+                        if str(code) in err_s:
+                            self._record_method_outcome(m_name, code, False)
+                            break
+
+            self._force_full_config_sync = False
 
         return self._extract_states_from_raw_sections()
 
@@ -2381,7 +2648,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             async with self._api_lock:
                 new_states = await self.hass.async_add_executor_job(
-                    self._read_switches_sync
+                    self._read_switches_sync, True
                 )
                 if new_states:
                     self._switch_states.update(new_states)
@@ -2394,6 +2661,25 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Enable or disable a specific AI detection, image processing, or hardware module on the camera."""
         tapo = self._ensure_tapo_sync()
         target_val = spec.on_value if enabled else spec.off_value
+
+        if spec.key == "privacy_mode_switch":
+            self._force_full_config_sync = True
+            try:
+                tapo.setPrivacyMode(enabled)
+                self._raw_sections[("lens_mask", "lens_mask_info")] = {
+                    "enabled": target_val
+                }
+                return
+            except Exception:
+                pass
+            tapo.executeFunction(
+                "setLensMaskConfig",
+                {"lens_mask": {"lens_mask_info": {"enabled": target_val}}},
+            )
+            self._raw_sections[("lens_mask", "lens_mask_info")] = {
+                "enabled": target_val
+            }
+            return
 
         if spec.key == "flip":
             try:

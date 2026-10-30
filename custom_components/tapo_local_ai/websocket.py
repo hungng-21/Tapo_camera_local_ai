@@ -43,7 +43,7 @@ from .const import (
     MIN_STRANGER_CLEAR_SECONDS,
 )
 from .coordinator import TapoLocalAICoordinator, async_load_history, history_store
-from .panel import async_sync_panel
+from .panel import async_sync_panel, entry_supports_face
 
 WS_GET_DATA = f"{DOMAIN}/get_data"
 WS_SAVE_FACE = f"{DOMAIN}/save_face"
@@ -191,11 +191,14 @@ async def websocket_get_data(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Return all configured camera Face Manager data."""
-    entries = hass.config_entries.async_entries(DOMAIN)
+    """Return all configured face-capable camera entries for the Face Manager."""
+    all_entries = hass.config_entries.async_entries(DOMAIN)
+    face_entries = [
+        entry for entry in all_entries if entry_supports_face(hass, entry)
+    ]
     connection.send_result(
         msg["id"],
-        {"entries": [_serialize_entry(hass, entry) for entry in entries]},
+        {"entries": [_serialize_entry(hass, entry) for entry in face_entries]},
     )
 
 

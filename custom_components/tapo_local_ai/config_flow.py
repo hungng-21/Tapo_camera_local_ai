@@ -13,7 +13,9 @@ from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .api import TapoC260Api
 from .const import (
     CONF_CLOUD_PASSWORD,
     CONF_CONTROL_PORT,
@@ -56,12 +58,46 @@ from .coordinator import (
     connect_tapo_multi_auth,
     parse_tapo_basic_info,
 )
+from .panel import entry_supports_face
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _validate_tapo_or_ports_sync(data: dict[str, Any]) -> dict[str, Any]:
-    """Validate camera via pytapo multi-auth, or fall back to checking RTSP/ONVIF TCP ports."""
+def _try_pytapo_sync(data: dict[str, Any]) -> dict[str, Any]:
+    """Try validating camera via pytapo multi-auth on port 443."""
+    host = data[CONF_HOST].strip()
+    username = data[CONF_USERNAME].strip()
+    password = data.get(CONF_PASSWORD, "")
+    cloud_password = data.get(CONF_CLOUD_PASSWORD, "").strip()
+    control_port = int(data.get(CONF_CONTROL_PORT, DEFAULT_CONTROL_PORT))
+
+    _, basic = connect_tapo_multi_auth(
+        host, username, password, cloud_password, control_port
+    )
+    meta = parse_tapo_basic_info(basic, host)
+    return {
+        "serial": meta["serial"],
+        "title": meta["alias"],
+        "model": meta["model"],
+        "mode": "full_local_api",
+    }
+
+
+def _check_ports_sync(data: dict[str, Any]) -> tuple[bool, bool]:
+    """Check if ONVIF or RTSP TCP ports are open."""
+    host = data[CONF_HOST].strip()
+    onvif_port = int(data.get(CONF_ONVIF_PORT, DEFAULT_ONVIF_PORT))
+    rtsp_port = int(data.get(CONF_RTSP_PORT, DEFAULT_RTSP_PORT))
+    return (
+        check_tcp_port(host, onvif_port, timeout=3.0),
+        check_tcp_port(host, rtsp_port, timeout=3.0),
+    )
+
+
+async def _async_validate_connection(
+    hass: HomeAssistant, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate camera connection using pytapo multi-auth -> C260 Secure Channel -> ONVIF/RTSP fallback."""
     host = data[CONF_HOST].strip()
     username = data[CONF_USERNAME].strip()
     password = data.get(CONF_PASSWORD, "")
@@ -70,81 +106,103 @@ def _validate_tapo_or_ports_sync(data: dict[str, Any]) -> dict[str, Any]:
     onvif_port = int(data.get(CONF_ONVIF_PORT, DEFAULT_ONVIF_PORT))
     rtsp_port = int(data.get(CONF_RTSP_PORT, DEFAULT_RTSP_PORT))
 
+    # 1. Primary: pytapo multi-auth
     try:
-        _, basic = connect_tapo_multi_auth(
-            host, username, password, cloud_password, control_port
-        )
-        meta = parse_tapo_basic_info(basic, host)
-        return {
-            "serial": meta["serial"],
-            "title": meta["alias"],
-            "mode": "full_local_api",
-        }
+        return await hass.async_add_executor_job(_try_pytapo_sync, data)
     except Exception as tapo_err:
-        _LOGGER.warning(
-            "Kết nối pytapo cổng %s tới %s chưa thành công (%s); kiểm tra cổng ONVIF (%s) / RTSP (%s)...",
+        _LOGGER.debug(
+            "Kết nối pytapo cổng %s tới %s chưa thành công (%s); thử C260 Secure Channel / ONVIF / RTSP...",
             control_port,
             host,
             tapo_err,
-            onvif_port,
-            rtsp_port,
         )
 
-    onvif_open = check_tcp_port(host, onvif_port, timeout=3.0)
-    rtsp_open = check_tcp_port(host, rtsp_port, timeout=3.0)
+    # 2. Secondary: TapoC260Api direct challenge/login (encrypt_type 3)
+    c260_secret = cloud_password or password
+    if c260_secret:
+        try:
+            session = async_get_clientsession(hass)
+            c260_api = TapoC260Api(session, host, username, c260_secret, hass=hass)
+            await c260_api.async_login()
+            title = f"Tapo C260 ({host})"
+            serial = f"tapo_c260_{host.replace('.', '_')}"
+            try:
+                dev_resp = await c260_api.async_secure_request(
+                    {
+                        "method": "multipleRequest",
+                        "params": {
+                            "requests": [
+                                {
+                                    "method": "getDeviceInfo",
+                                    "params": {"device_info": {"name": ["basic_info"]}},
+                                }
+                            ]
+                        },
+                    }
+                )
+                basic_raw = (
+                    dev_resp.get("result", {})
+                    .get("responses", [{}])[0]
+                    .get("result", {})
+                )
+                if isinstance(basic_raw, dict) and basic_raw:
+                    meta = parse_tapo_basic_info(basic_raw, host)
+                    serial = meta["serial"]
+                    title = meta["alias"]
+            except Exception:
+                pass
+            return {
+                "serial": serial,
+                "title": title,
+                "model": "Tapo C260",
+                "mode": "c260_secure_api",
+            }
+        except Exception as c260_err:
+            _LOGGER.debug("C260 Secure Channel tới %s thất bại: %s", host, c260_err)
+
+    # 3. Tertiary: ONVIF / RTSP port fallback
+    onvif_open, rtsp_open = await hass.async_add_executor_job(_check_ports_sync, data)
     if onvif_open or rtsp_open:
-        fallback_serial = f"tapo_{host.replace('.', '_')}"
-        fallback_title = f"Tapo {username} ({host})"
-        return {
-            "serial": fallback_serial,
-            "title": fallback_title,
+        info: dict[str, Any] = {
+            "serial": f"tapo_{host.replace('.', '_')}",
+            "title": f"Tapo {username} ({host})",
             "mode": "onvif_rtsp_fallback",
             "onvif_open": onvif_open,
         }
+        if onvif_open:
+            try:
+                import onvif
+                from onvif import ONVIFCamera
+
+                wsdl_dir = f"{os.path.dirname(onvif.__file__)}/wsdl/"
+                cam = ONVIFCamera(
+                    host,
+                    onvif_port,
+                    username,
+                    password or cloud_password,
+                    wsdl_dir,
+                    no_cache=True,
+                )
+                await cam.update_xaddrs()
+                dev_mgmt = await cam.create_devicemgmt_service()
+                dev_info = await dev_mgmt.GetDeviceInformation()
+                serial = getattr(dev_info, "SerialNumber", None)
+                model = getattr(dev_info, "Model", None)
+                if serial:
+                    info["serial"] = str(serial)
+                if model:
+                    info["title"] = f"{model} ({host})"
+                    info["model"] = str(model)
+                await cam.close()
+            except Exception as onvif_err:
+                _LOGGER.debug(
+                    "Không đọc được GetDeviceInformation qua ONVIF: %s", onvif_err
+                )
+        return info
 
     raise ConnectionError(
         f"Không thể kết nối tới {host} trên cả cổng {control_port}, {onvif_port} và {rtsp_port}."
     )
-
-
-async def _async_validate_connection(
-    hass: HomeAssistant, data: dict[str, Any]
-) -> dict[str, Any]:
-    """Validate camera connection using executor + optional ONVIF device info lookup."""
-    info = await hass.async_add_executor_job(_validate_tapo_or_ports_sync, data)
-
-    if info.get("mode") == "onvif_rtsp_fallback" and info.get("onvif_open"):
-        try:
-            import onvif
-            from onvif import ONVIFCamera
-
-            host = data[CONF_HOST].strip()
-            onvif_port = int(data.get(CONF_ONVIF_PORT, DEFAULT_ONVIF_PORT))
-            wsdl_dir = f"{os.path.dirname(onvif.__file__)}/wsdl/"
-            cam = ONVIFCamera(
-                host,
-                onvif_port,
-                data[CONF_USERNAME].strip(),
-                data.get(CONF_PASSWORD, ""),
-                wsdl_dir,
-                no_cache=True,
-            )
-            await cam.update_xaddrs()
-            dev_mgmt = await cam.create_devicemgmt_service()
-            dev_info = await dev_mgmt.GetDeviceInformation()
-            serial = getattr(dev_info, "SerialNumber", None)
-            model = getattr(dev_info, "Model", None)
-            if serial:
-                info["serial"] = str(serial)
-            if model:
-                info["title"] = f"{model} ({host})"
-            await cam.close()
-        except Exception as onvif_err:
-            _LOGGER.debug(
-                "Không đọc được GetDeviceInformation qua ONVIF: %s", onvif_err
-            )
-
-    return info
 
 
 def _build_full_schema(defaults: dict[str, Any]) -> vol.Schema:
@@ -337,12 +395,15 @@ class TapoLocalAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class TapoLocalAIOptionsFlowHandler(config_entries.OptionsFlow):
-    """Unified Options Flow managing Connection/ONVIF settings and C260 Face Recognition & Sidebar."""
+    """Unified Options Flow: opens Connection settings directly on standard cameras, or full Face Management menu on Face AI cameras."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Show management menu."""
+        """Show management menu for Face AI cameras, or go straight to connection form for standard cameras."""
+        if not entry_supports_face(self.hass, self.config_entry):
+            return await self.async_step_connection(user_input)
+
         return self.async_show_menu(
             step_id="init",
             menu_options=[

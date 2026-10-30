@@ -1,0 +1,48 @@
+ptz_move:
+  name: Di chuyển PTZ (Pan/Tilt)
+  description: Điều khiển xoay motor camera Tapo theo góc Pan (ngang) và Tilt (dọc) tương đối.
+  target:
+    entity:
+      integration: tapo_local_ai
+      domain: camera
+  fields:
+    pan:
+      name: Góc xoay ngang (Pan)
+      description: Góc xoay ngang tính bằng độ (-360 đến 360). Số dương xoay phải, số âm xoay trái.
+      required: true
+      default: 0
+      selector:
+        number:
+          min: -360
+          max: 360
+          step: 1
+          unit_of_measurement: "°"
+          mode: slider
+    tilt:
+      name: Góc xoay dọc (Tilt)
+      description: Góc xoay dọc tính bằng độ (-90 đến 90). Số dương xoay lên, số âm xoay xuống.
+      required: true
+      default: 0
+      selector:
+        number:
+          min: -90
+          max: 90
+          step: 1
+          unit_of_measurement: "°"
+          mode: slider
+
+ptz_goto_preset:
+  name: Di chuyển tới điểm nhớ PTZ (Preset)
+  description: Đưa camera xoay tới vị trí điểm nhớ (Preset ID hoặc tên Preset) đã lưu.
+  target:
+    entity:
+      integration: tapo_local_ai
+      domain: camera
+  fields:
+    preset_id:
+      name: ID hoặc tên điểm nhớ (Preset)
+      description: Nhập ID hoặc tên điểm nhớ PTZ đã lưu trên camera.
+      required: true
+      example: "1"
+      selector:
+        text:
