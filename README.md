@@ -10,9 +10,9 @@ Tích hợp hoạt động **100% nội bộ (Local LAN)** không thông qua má
 
 ---
 
-## 🚀 Điểm mới & Bản vá lỗi trong phiên bản v2.0.1
+## 🚀 Điểm mới & Bản vá lỗi trong phiên bản v2.0.0
 
-Bản cập nhật v2.0.1 tập trung tối ưu độ ổn định cao nhất khi triển khai đồng thời nhiều camera trong gia đình (đặc biệt các dòng có màn trập vật lý như **C125** và dòng xoay quét như **C225**):
+Bản cập nhật v2.0.2 tập trung tối ưu độ ổn định cao nhất khi triển khai đồng thời nhiều camera trong gia đình (đặc biệt các dòng có màn trập vật lý như **C125** và dòng xoay quét như **C225**):
 
 * **Sửa lỗi `NameError: CONF_FACES` khi thêm camera PTZ**: Khắc phục triệt để lỗi crash luồng kiểm tra quyền sidebar khi kết nối camera thứ 2 (như C225, C200, C500...).
 * **Bổ sung `services.yaml` chuẩn hóa**: Khai báo đầy đủ 2 entity service điều khiển xoay quét (`tapo_local_ai.ptz_move` và `tapo_local_ai.ptz_goto_preset`), loại bỏ hoàn toàn cảnh báo thiếu file dịch vụ trong nhật ký Home Assistant.
