@@ -1,41 +1,57 @@
-# Tapo Camera Local AI — Ultimate Edition (v2.0.0)
+# Tapo Camera Local AI — v2.0.1
 
-[](https://github.com/hacs/integration)
-[GitHub Release](https://www.google.com/search?q=https://github.com/hungng-21/Tapo_camera_local_ai/releases)
-[](https://www.home-assistant.io/)
-[](https://www.home-assistant.io/)
-[License](https://www.google.com/search?q=LICENSE)
+[](https://github.com/hacs/default)
+[GitHub release (latest by date)](https://www.google.com/search?q=https://github.com/hungng-21/Tapo_camera_local_ai/releases)
+[License: MIT](https://www.google.com/search?q=LICENSE)
 
-[Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://www.google.com/search?q=https://my.home-assistant.io/redirect/hacs_repository/%3Fowner%3Dhungng-21%26repository%3DTapo_camera_local_ai%26category%3Dintegration)
+**Tapo Camera Local AI** là giải pháp Custom Component toàn diện và tối ưu nhất để kết nối, điều khiển và khai thác toàn bộ sức mạnh AI của camera **TP-Link Tapo** trên **Home Assistant**.
 
-**Tapo Camera Local AI** là giải pháp Custom Component toàn diện và tối ưu nhất để kết nối, điều khiển và khai thác toàn bộ sức mạnh AI của camera **TP-Link Tapo** trên **Home Assistant**. 
-
-Tích hợp hoạt động **100% nội bộ (Local LAN)** không thông qua máy chủ đám mây (Cloud), không tốn phí thuê bao (No Subscription), đảm bảo tốc độ phản hồi tính bằng mili-giây và bảo mật dữ liệu riêng tư tuyệt đối.
+Tích hợp hoạt động **100% nội bộ (Local LAN)** không thông qua máy chủ đám mây (Cloud), không tốn phí thuê bao (No Subscription), đảm bảo tốc độ phản hồi mili-giây và bảo mật dữ liệu riêng tư tuyệt đối.
 
 ---
 
-## 🌟 Điểm nổi bật của phiên bản v2.0.0 (Ultimate Edition)
+## 🚀 Điểm mới & Bản vá lỗi trong phiên bản v2.0.1
 
-* **Hợp nhất Nhận diện Khuôn mặt (Face Recognition) & Bảng điều khiển "Tapo Face Manager"**: Tích hợp toàn bộ hệ thống quản lý khuôn mặt thông minh từ dự án `tapo-c260-face` (của `@quangtienhn`), gom vào **duy nhất 1 phiên kết nối Local** giúp loại bỏ 100% lỗi xung đột phiên (Session Fighting / Rate-limit -40404).
+Bản cập nhật v2.0.1 tập trung tối ưu độ ổn định cao nhất khi triển khai đồng thời nhiều camera trong gia đình (đặc biệt các dòng có màn trập vật lý như **C125** và dòng xoay quét như **C225**):
+
+* **Sửa lỗi `NameError: CONF_FACES` khi thêm camera PTZ**: Khắc phục triệt để lỗi crash luồng kiểm tra quyền sidebar khi kết nối camera thứ 2 (như C225, C200, C500...).
+* **Bổ sung `services.yaml` chuẩn hóa**: Khai báo đầy đủ 2 entity service điều khiển xoay quét (`tapo_local_ai.ptz_move` và `tapo_local_ai.ptz_goto_preset`), loại bỏ hoàn toàn cảnh báo thiếu file dịch vụ trong nhật ký Home Assistant.
+* **Đồng bộ tức thì Chế độ riêng tư (Privacy Mode / Màn trập vật lý)**: 
+  * Tách riêng luồng đọc trực tiếp `getLensMaskConfig` / `getPrivacyMode()` ở đầu mỗi chu kỳ 3 giây.
+  * Khi bạn bật/tắt Privacy Mode trên ứng dụng Tapo hoặc bấm nút vật lý trên thân camera C125/C225, công tắc trên Home Assistant sẽ cập nhật trạng thái ngay lập tức.
+  * Tự động bảo vệ không bao giờ đưa các hàm cốt lõi vào danh sách đen khi camera đang che ống kính.
+* **Triệt tiêu hoàn toàn lỗi ngắt kết nối 5 phút (300s Lockout / `-40404`)**:
+  * Lưu cố định phương thức xác thực thành công (`_working_auth`), ưu tiên làm mới token phiên (`refreshStok`) thay vì thử lại các tổ hợp mật khẩu khác nhau gây kích hoạt bộ đếm khóa IP brute-force của camera.
+  * Tắt hoàn toàn luồng thử nghiệm C260 đối với các dòng camera không có Face AI (C125, C225, C200...).
+  * Giảm 75% tải gói tin API trong các chu kỳ rảnh rỗi và tự động tạm dừng truy vấn module hình ảnh khi màn trập vật lý đang đóng.
+* **Giao diện Cấu hình Thích ứng Thông minh (Dynamic UI)**:
+  * Khi bấm nút bánh răng (Cấu hình) trên các camera thường (C125, C225), hệ thống mở thẳng vào bảng cài đặt kết nối mạng/tài khoản/chu kỳ poll thay vì hiển thị menu 10 mục Face ID của C260.
+  * Bảng điều khiển **Tapo Face Manager** trên thanh bên (Sidebar) tự động ẩn đi nếu trong nhà không có camera Face AI, giữ giao diện Home Assistant luôn gọn gàng.
+
+---
+
+## 🌟 Tính năng cốt lõi của dòng Ultimate Edition
+
+* **Hợp nhất Nhận diện Khuôn mặt (Face Recognition) & Bảng điều khiển "Tapo Face Manager"**: Tích hợp toàn bộ hệ thống quản lý khuôn mặt thông minh từ dự án `tapo-c260-face` (của `@quangtienhn`), gom vào **duy nhất 1 phiên kết nối Local** giúp loại bỏ xung đột phiên.
 * **Tự nhận diện phần cứng thông minh (Hardware Auto-Detection)**:
-  * Camera có xoay quét (PTZ) $\rightarrow$ Tự kích hoạt 4 nút điều hướng, hiệu chuẩn, thanh trượt góc xoay, điểm nhớ Preset và chế độ tuần tra. Camera cố định $\rightarrow$ Tự ẩn sạch nút xoay.
-  * Camera có Face AI (như **Tapo C260**) $\rightarrow$ Tự kích hoạt cảm biến khuôn mặt, lịch sử xuất hiện và bảng điều khiển Sidebar. Camera thường (C100, C110, C120, C125, C200, C210, C310, C500...) $\rightarrow$ **Tự ẩn toàn bộ entity khuôn mặt thừa** và tự dọn dẹp Entity Registry.
+  * Camera xoay quét (PTZ) $\rightarrow$ Tự kích hoạt 4 nút điều hướng, hiệu chuẩn motor, thanh trượt góc xoay, điểm nhớ Preset và chế độ tuần tra (Cruise). Camera cố định $\rightarrow$ Tự ẩn sạch nút xoay.
+  * Camera có Face AI (như **Tapo C260**) $\rightarrow$ Tự kích hoạt cảm biến khuôn mặt, lịch sử xuất hiện và bảng điều khiển Sidebar. Camera thường (C100, C110, C120, C125, C200, C210, C310, C500...) $\rightarrow$ Tự ẩn toàn bộ entity khuôn mặt thừa.
 * **Tách biệt chuẩn hóa Độ nhạy AI (AI Sensitivity Separation)**:
   * **4 thanh trượt 10 mức (`number`)**: Dành riêng cho các cảm biến hình ảnh 1–10 trong app Tapo (**Motion**, **Person**, **Pet**, **Vehicle**).
-  * **5 hộp chọn 3 mức (`select`)**: Dành riêng cho các cảm biến âm thanh chỉ có 3 mức trong app Tapo (**Baby Cry**, **Dog Bark**, **Cat Meow**, **Glass Break**, **Tamper** với 3 giá trị: `low`, `normal`, `high`).
-* **Hỗ trợ đầy đủ còi báo động (`siren`) & điều khiển âm thanh 2 chiều**: Bật/tắt còi kèm độ dài thời gian hú (`duration`) và âm lượng (`volume_level`), thanh trượt âm lượng Loa/Micro (0–100%), công tắc ngắt Micro phần cứng.
-* **Chống nghẽn & Độc lập đa luồng**: Luồng RTSP Video (cổng 554) và ONVIF (cổng 2020) chạy độc lập; các truy vấn công tắc và độ nhạy được gộp thành 1 request duy nhất (`multipleRequest`), phản hồi cực nhanh ~50ms.
+  * **5 hộp chọn 3 mức (`select`)**: Dành riêng cho các cảm biến âm thanh 3 mức trong app Tapo (**Baby Cry**, **Dog Bark**, **Cat Meow**, **Glass Break**, **Tamper** với 3 giá trị: `low`, `normal`, `high`).
+* **Hỗ trợ còi báo động (`siren`) & điều khiển âm thanh 2 chiều**: Bật/tắt còi kèm độ dài thời gian hú (`duration`) và âm lượng (`volume_level`), thanh trượt âm lượng Loa/Micro (0–100%), công tắc ngắt Micro phần cứng.
+* **Độc lập đa luồng**: Luồng RTSP Video (cổng 554) và ONVIF (cổng 2020) chạy độc lập; các truy vấn công tắc và độ nhạy được gộp thành 1 request duy nhất (`multipleRequest`), phản hồi cực nhanh ~50ms.
 
 ---
 
-## 📸 Giao diện Bảng điều khiển "Tapo Face Manager" (Sidebar)
+## 📸 Bảng điều khiển "Tapo Face Manager" (Sidebar)
 
-Khi hệ thống có camera hỗ trợ nhận diện khuôn mặt (**Tapo C260**), Home Assistant sẽ tự động xuất hiện mục **Tapo Face Manager** trên thanh bên (Sidebar):
+Khi hệ thống có camera hỗ trợ nhận diện khuôn mặt (**Tapo C260**), Home Assistant sẽ tự động xuất hiện mục **Tapo Face Manager** trên thanh bên:
 
 * **Tab Người quen (Known)**: Danh sách người nhà đã nhận diện, hỗ trợ đổi tên, cập nhật mã Face ID và tự động chuyển tiếp lịch sử cũ sang ID mới.
-* **Tab Người lạ (Unknown)**: Bắt trọn mọi khuôn mặt lạ mà camera phát hiện, hiển thị số lần xuất hiện, lần đầu và lần cuối nhìn thấy. Hỗ trợ bấm **"+ Thêm người"** để đặt tên tức thì chỉ với 1 cú click.
+* **Tab Người lạ (Unknown)**: Lưu giữ các khuôn mặt lạ mà camera phát hiện, hiển thị số lần xuất hiện, lần đầu và lần cuối nhìn thấy. Hỗ trợ bấm **"+ Thêm người"** để đặt tên tức thì chỉ với 1 cú click.
 * **Tab Lịch sử ngày (Day History)**: Biểu đồ thời gian thực (24 giờ) trực quan từng phút từng giây ai đã xuất hiện trước camera.
-* **Tab Thống kê (Statistics)**: Biểu đồ cột tổng hợp tần suất người quen / người lạ theo 7 ngày, 30 ngày, 90 ngày và phân tích ngày cao điểm.
+* **Tab Thống kê (Statistics)**: Biểu đồ cột tổng hợp tần suất người quen / người lạ theo 7 ngày, 30 ngày, 90 ngày.
 * **Tab Cài đặt & Thẻ Sức khỏe kết nối (Health Diagnostics)**: Đo thời gian phản hồi (ms), số lỗi liên tiếp và cho phép tinh chỉnh chu kỳ quét, thời gian chống lặp (Dedup cooldown), thời gian tự tắt cảm biến người lạ trực tiếp trên Web.
 
 > [!NOTE]
@@ -87,7 +103,7 @@ Toàn bộ các thực thể được gom chung vào **1 Thiết bị Camera duy
 ### 6. Công tắc AI & Phần cứng (`switch`)
 * 10 công tắc bật/tắt từng tính năng AI Detection riêng biệt.
 * `Tự động xoay theo chuyển động` (`auto_track_switch` — chỉ có trên camera PTZ).
-* `Chế độ riêng tư (Privacy Mode)` (`privacy_mode_switch` — cụp ống kính / tắt hình).
+* `Chế độ riêng tư (Privacy Mode)` (`privacy_mode_switch` — cụp ống kính / đóng màn trập).
 * `Đèn trạng thái LED` (`led_indicator_switch`).
 * `Đảo ngược hình ảnh 180°` (`flip`).
 * `Khử cong viền góc rộng` (`lens_distortion`).
@@ -105,20 +121,18 @@ Toàn bộ các thực thể được gom chung vào **1 Thiết bị Camera duy
 ## 🚀 Hướng dẫn Cài đặt
 
 ### Cách 1: Cài đặt tự động qua HACS (Khuyên dùng)
-
 1. Mở Home Assistant $\rightarrow$ chọn **HACS** ở thanh bên trái.
 2. Nhấp vào dấu **3 chấm** ở góc trên bên phải $\rightarrow$ chọn **Custom repositories (Kho lưu trữ tùy chỉnh)**.
 3. Dán đường dẫn sau vào ô Repository:
-   ```text
+   ```
    https://github.com/hungng-21/Tapo_camera_local_ai
    ```
 4. Chọn danh mục: **Integration** $\rightarrow$ bấm **Add**.
-5. Tìm kiếm `Tapo Camera Local AI` $\rightarrow$ bấm **Download** phiên bản mới nhất (`v2.0.0`).
+5. Tìm kiếm `Tapo Camera Local AI` $\rightarrow$ bấm **Download** phiên bản mới nhất (`v2.0.1`).
 6. Khởi động lại Home Assistant.
 
 ### Cách 2: Cài đặt thủ công (Manual)
-
-1. Tải file `tapo_local_ai.zip` từ trang [Releases](https://www.google.com/search?q=https://github.com/hungng-21/Tapo_camera_local_ai/releases).
+1. Tải file `tapo_local_ai_v2.0.1_fixed.zip` từ trang [Releases](https://www.google.com/search?q=https://github.com/hungng-21/Tapo_camera_local_ai/releases).
 2. Giải nén file, sao chép toàn bộ thư mục `tapo_local_ai` vào đường dẫn `/config/custom_components/` của Home Assistant (đường dẫn đầy đủ: `/config/custom_components/tapo_local_ai/`).
 3. Khởi động lại Home Assistant.
 
@@ -129,19 +143,19 @@ Toàn bộ các thực thể được gom chung vào **1 Thiết bị Camera duy
 1. Mở ứng dụng **Tapo** trên điện thoại: vào mục cài đặt camera $\rightarrow$ **Cài đặt nâng cao (Advanced Settings)** $\rightarrow$ **Tài khoản Camera (Camera Account)** $\rightarrow$ Tạo tài khoản cục bộ (Username & Password).
 2. Trên Home Assistant: Vào **Cài đặt (Settings)** $\rightarrow$ **Thiết bị & Dịch vụ (Devices & Services)** $\rightarrow$ **Thêm tích hợp (Add Integration)** $\rightarrow$ Tìm kiếm **Tapo Camera Local AI**.
 3. Điền các thông số:
-   * **Host**: Địa chỉ IP nội bộ của camera (ví dụ `192.168.1.100`, nên đặt IP tĩnh trong router).
+   * **Host**: Địa chỉ IP nội bộ của camera (ví dụ `192.168.1.100`, nên gán IP tĩnh trong router).
    * **Username**: Tên tài khoản Camera Account vừa tạo ở Bước 1.
    * **Password**: Mật khẩu Camera Account vừa tạo ở Bước 1.
-   * **Cloud Password (Tùy chọn)**: Mật khẩu tài khoản TP-Link Cloud (cần thiết đối với các dòng firmware mới dùng chuẩn bảo mật KLAP/TPAP và dòng **Tapo C260**).
+   * **Cloud Password (Tùy chọn)**: Mật khẩu tài khoản TP-Link Cloud (cần thiết đối với dòng **Tapo C260** hoặc firmware mới dùng mã hóa bảo mật KLAP/TPAP).
    * Các cổng mặc định: Điều khiển HTTPS (`443`), ONVIF (`2020`), RTSP (`554`).
 4. Bấm **Gửi (Submit)**. Camera sẽ được kết nối ngay lập tức!
-5. Nhấn **Ctrl + F5** trên trình duyệt máy tính để nạp bảng điều khiển **Tapo Face Manager** ở thanh bên.
+5. Nhấn **Ctrl + F5** trên trình duyệt máy tính để nạp bảng điều khiển **Tapo Face Manager** ở thanh bên (nếu camera có hỗ trợ Face AI).
 
 ---
 
 ## 💡 Ví dụ Automation thông minh mẫu
 
-### 1. Chào đón người nhà khi về đến cửa (Nhận diện khuôn mặt)
+### 1. Chào đón người nhà khi về đến cửa (Nhận diện khuôn mặt C260)
 ```yaml
 alias: "Camera C260 - Chào người quen"
 trigger:
@@ -198,18 +212,18 @@ action:
 ## ❓ Câu hỏi thường gặp (FAQ)
 
 &lt;details&gt;
-&lt;summary&gt;&lt;b&gt;1. Tôi cập nhật từ v1.x lên v2.0.0 thì camera cũ có bị mất cấu hình không?&lt;/b&gt;&lt;/summary&gt;
-Hoàn toàn &lt;b&gt;KHÔNG&lt;/b&gt;. Bản v2.0.0 tương thích ngược 100%. Tất cả Entity ID, tên gọi, các thẻ trên Dashboard và Automation bạn đã tạo từ trước đều được giữ nguyên vẹn.
+&lt;summary&gt;&lt;b&gt;1. Tôi cập nhật từ v2.0.0 lên v2.0.1 thì camera đang có sẵn có bị ảnh hưởng không?&lt;/b&gt;&lt;/summary&gt;
+Hoàn toàn &lt;b&gt;KHÔNG&lt;/b&gt;. Bản v2.0.1 tương thích ngược 100%. Tất cả Entity ID, tên gọi, các thẻ trên Dashboard và Automation bạn đã tạo từ trước đều được giữ nguyên vẹn.
 &lt;/details&gt;
 
 &lt;details&gt;
-&lt;summary&gt;&lt;b&gt;2. Camera của tôi không có Face AI (như C125, C200, C210...) thì có bị hiện các thực thể thừa không?&lt;/b&gt;&lt;/summary&gt;
-&lt;b&gt;KHÔNG&lt;/b&gt;. Hệ thống tự động nhận diện model phần cứng. Nếu camera không có Face AI, toàn bộ các entity khuôn mặt sẽ tự động được ẩn đi và dọn sạch, bảng Face Manager trên thanh bên cũng chỉ xuất hiện khi bạn có ít nhất một camera C260.
+&lt;summary&gt;&lt;b&gt;2. Camera của tôi là C125 / C225 thì bấm nút bánh răng có bị hiện menu Face ID thừa không?&lt;/b&gt;&lt;/summary&gt;
+&lt;b&gt;KHÔNG&lt;/b&gt;. Bản v2.0.1 tự động phát hiện mã phần cứng camera. Với C125/C225, bấm nút bánh răng sẽ mở thẳng vào form chỉnh IP/kết nối; thanh bên Face Manager cũng tự động ẩn đi để giao diện Home Assistant luôn sạch sẽ.
 &lt;/details&gt;
 
 &lt;details&gt;
-&lt;summary&gt;&lt;b&gt;3. Làm thế nào để camera không bị khóa bảo mật (-40404)?&lt;/b&gt;&lt;/summary&gt;
-Bản v2.0.0 đã gộp toàn bộ việc lấy dữ liệu AI và Face ID vào &lt;b&gt;chỉ 1 phiên kết nối duy nhất&lt;/b&gt;, loại bỏ hoàn toàn việc tranh chấp cổng 443. Ngoài ra, cơ chế giãn cách tự động 60s sẽ lập tức kích hoạt nếu camera có dấu hiệu từ chối kết nối, đảm bảo không bao giờ bị khóa tạm thời.
+&lt;summary&gt;&lt;b&gt;3. Tại sao camera C125 trước đây bị mất kết nối 5 phút rồi tự có lại?&lt;/b&gt;&lt;/summary&gt;
+Đó là cơ chế bảo mật khóa IP 300 giây (mã lỗi &lt;code&gt;-40404&lt;/code&gt;) của firmware Tapo khi có nhiều lần thử mật khẩu sai liên tiếp. Bản v2.0.1 đã lưu cố định thông tin xác thực thành công và tắt luồng C260 thừa, chấm dứt hoàn toàn tình trạng này.
 &lt;/details&gt;
 
 ---
