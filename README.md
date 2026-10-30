@@ -1,4 +1,4 @@
-# Tapo Camera Local AI — v2.0.1
+# Tapo Camera Local AI — v2.0.2
 
 [](https://github.com/hacs/default)
 [GitHub release (latest by date)](https://www.google.com/search?q=https://github.com/hungng-21/Tapo_camera_local_ai/releases)
