@@ -2124,7 +2124,6 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
             try:
                 tapo.executeFunction(spec.set_method, payload)
-                return
             except Exception:
                 tapo.executeFunction(
                     spec.set_method,
@@ -2137,7 +2136,12 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         }
                     },
                 )
-                return
+            sec = self._raw_sections.setdefault((spec.module, spec.section), {})
+            sec["enabled"] = enabled_str
+            sec["sensitivity"] = api_word
+            sec["digital_sensitivity"] = numeric_str
+            self._force_full_config_sync = True
+            return
 
         fmt = self._sensitivity_format.get(spec.key, spec.default_format)
         primary_val = api_word if fmt == "word" else numeric_str
@@ -2170,6 +2174,10 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._sensitivity_format[spec.key] = (
                 "numeric" if fmt == "word" else "word"
             )
+        sec = self._raw_sections.setdefault((spec.module, spec.section), {})
+        sec["enabled"] = enabled_str
+        sec["sensitivity"] = primary_val
+        self._force_full_config_sync = True
 
     async def async_set_sensitivity_10(
         self, spec: TapoSensitivitySpec, level: int
@@ -2219,7 +2227,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         do_full_sync = (
             self._force_full_config_sync
             or not self._switch_states
-            or (self._poll_counter % 3 == 1)
+            or (self._poll_counter % 2 == 1)
         )
 
         try:
@@ -2568,19 +2576,15 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return self._extract_states_from_raw_sections()
 
         req_list = self._build_batch_requests()
+        # On Tapo C125 and resource-constrained cameras, sending 15 requests in 1 batch causes
+        # internal query error (-100001) or drops. Chunk requests into micro-batches of 3:
+        CHUNK_SIZE = 3
+        failed_methods: list[dict[str, Any]] = []
 
-        if req_list:
+        for i in range(0, len(req_list), CHUNK_SIZE):
+            chunk = req_list[i : i + CHUNK_SIZE]
             try:
-                raw_resp: Any = None
-                if hasattr(tapo, "performRequest"):
-                    raw_resp = tapo.performRequest(
-                        {"method": "multipleRequest", "params": {"requests": req_list}}
-                    )
-                else:
-                    raw_resp = tapo.executeFunction(
-                        "multipleRequest", {"requests": req_list}
-                    )
-
+                raw_resp = tapo.executeFunction("multipleRequest", {"requests": chunk})
                 resp_items: list[Any] | None = None
                 if isinstance(raw_resp, dict):
                     if "result" in raw_resp and isinstance(raw_resp["result"], dict):
@@ -2591,56 +2595,44 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     resp_items = raw_resp
 
                 if isinstance(resp_items, list) and resp_items:
-                    # Check if lens_mask inside batch indicates privacy mode is active
-                    batch_privacy = bool(is_privacy)
                     for idx, item in enumerate(resp_items):
                         if not isinstance(item, dict):
                             continue
                         err_code = int(item.get("error_code", 0) or 0)
                         method_name = item.get("method") or (
-                            req_list[idx]["method"] if idx < len(req_list) else ""
+                            chunk[idx]["method"] if idx < len(chunk) else ""
                         )
                         if err_code != 0:
-                            self._record_method_outcome(
-                                method_name, err_code, batch_privacy
-                            )
+                            if idx < len(chunk):
+                                failed_methods.append(chunk[idx])
                             continue
-                        self._record_method_outcome(method_name, 0, batch_privacy)
+                        self._record_method_outcome(method_name, 0, False)
                         res_body = item.get("result", item)
                         if isinstance(res_body, dict):
                             self._ingest_result_body(res_body)
+                else:
+                    failed_methods.extend(chunk)
+            except Exception:
+                failed_methods.extend(chunk)
 
-                    self._force_full_config_sync = False
-                    states = self._extract_states_from_raw_sections()
-                    if states:
-                        return states
-            except Exception as batch_err:
-                _LOGGER.debug(
-                    "multipleRequest đọc trạng thái trên %s gặp lỗi (%s), chuyển sang đọc từng phần",
-                    self.host,
-                    batch_err,
-                )
+        # Query any methods that failed in batch individually
+        for req in failed_methods:
+            m_name = req["method"]
+            if m_name in self._unsupported_batch_methods:
+                continue
+            try:
+                res = tapo.executeFunction(m_name, req["params"])
+                if isinstance(res, dict):
+                    self._record_method_outcome(m_name, 0, False)
+                    self._ingest_result_body(res)
+            except Exception as single_err:
+                err_s = str(single_err)
+                for code in UNSUPPORTED_ERROR_CODES:
+                    if str(code) in err_s:
+                        self._record_method_outcome(m_name, code, False)
+                        break
 
-        # Fallback: query individual modules only if Privacy Mode is OFF
-        if not self._switch_states.get("privacy_mode_switch", False):
-            for req in req_list:
-                m_name = req["method"]
-                if m_name == "getLensMaskConfig" and is_privacy is not None:
-                    continue
-                try:
-                    res = tapo.executeFunction(m_name, req["params"])
-                    if isinstance(res, dict):
-                        self._record_method_outcome(m_name, 0, False)
-                        self._ingest_result_body(res)
-                except Exception as single_err:
-                    err_s = str(single_err)
-                    for code in UNSUPPORTED_ERROR_CODES:
-                        if str(code) in err_s:
-                            self._record_method_outcome(m_name, code, False)
-                            break
-
-            self._force_full_config_sync = False
-
+        self._force_full_config_sync = False
         return self._extract_states_from_raw_sections()
 
     async def async_refresh_switches(self) -> None:
@@ -2768,6 +2760,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
         }
         tapo.executeFunction(spec.set_method, payload)
+        self._raw_sections.setdefault((spec.get_module, spec.get_section), {})[spec.field_name] = target_val
+        self._force_full_config_sync = True
 
     async def async_set_ai_switch(self, spec: TapoAISwitchSpec, enabled: bool) -> None:
         """Set an AI detection or hardware switch state and update coordinator data."""
