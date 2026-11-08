@@ -1,8 +1,8 @@
-# Tapo Camera Local AI — v2.0.2
+# Tapo Camera Local AI — v2.1.0
 
 [](https://github.com/hacs/default)
-[GitHub release (latest by date)](https://www.google.com/search?q=https://github.com/hungng-21/Tapo_camera_local_ai/releases)
-[License: MIT](https://www.google.com/search?q=LICENSE)
+[GitHub release (latest by date)](https://github.com/hungng-21/Tapo_camera_local_ai/releases)
+**License: MIT**
 
 **Tapo Camera Local AI** là giải pháp Custom Component toàn diện và tối ưu nhất để kết nối, điều khiển và khai thác toàn bộ sức mạnh AI của camera **TP-Link Tapo** trên **Home Assistant**.
 
@@ -10,7 +10,26 @@ Tích hợp hoạt động **100% nội bộ (Local LAN)** không thông qua má
 
 ---
 
-## 🚀 Điểm mới & Bản vá lỗi trong phiên bản v2.0.0
+## 🚀 Điểm mới trong phiên bản v2.1.0
+
+Bản v2.1.0 giảm tải cho camera và xử lý đúng khi camera mất kết nối:
+
+* **Giảm khoảng 3 lần số request gửi tới camera** (khoảng 90 xuống 29 request/phút ở chu kỳ 3 giây):
+  * Cấu hình AI/hình ảnh/âm thanh đồng bộ mỗi **60 giây** (trước đây mỗi 6 giây), và ngay sau khi bạn đổi cài đặt từ Home Assistant.
+  * Chế độ riêng tư (Privacy Mode) đọc mỗi **15 giây** thay vì mỗi 3 giây; bỏ request `getLensMaskConfig` bị gửi trùng.
+  * Thay đổi làm trong app Tapo sẽ hiện lên Home Assistant trong vòng 15 giây (Privacy Mode) hoặc 60 giây (các cài đặt khác).
+* **Dừng poll ngay khi camera mất mạng**: trước đây mỗi chu kỳ còn gửi tiếp khoảng 24 request lỗi, khiến Home Assistant phát hiện camera có lại chậm tới khoảng 3 phút và các lệnh (còi, PTZ...) phải chờ. Giờ chỉ còn 1 request.
+* **Entity chuyển `unavailable` khi camera mất liên lạc quá 60 giây** (thay vì giữ trạng thái cũ, ví dụ "không phát hiện người"). Các entity chẩn đoán (Kết nối Camera, Số lỗi quét...) vẫn luôn hiển thị.
+* **Bảo mật**: các lệnh WebSocket của Face Manager giờ yêu cầu tài khoản admin.
+* **Sửa lỗi**:
+  * Cảm biến ONVIF không còn bị kẹt `on` khi kết nối ONVIF đứt giữa chừng.
+  * Đổi kiểu/âm lượng/thời gian còi không còn có thể vô tình bật/tắt báo động tự động.
+  * Lỗi `STORAGE_NOT_EXIST` (camera không có thẻ nhớ) không còn bị tính là mất kết nối.
+  * Lưu đúng giá trị độ nhạy đã gửi tới camera.
+
+---
+
+## 🚀 Điểm mới & Bản vá lỗi trong phiên bản v2.0.2
 
 Bản cập nhật v2.0.2 tập trung tối ưu độ ổn định cao nhất khi triển khai đồng thời nhiều camera trong gia đình (đặc biệt các dòng có màn trập vật lý như **C125** và dòng xoay quét như **C225**):
 
@@ -132,7 +151,7 @@ Toàn bộ các thực thể được gom chung vào **1 Thiết bị Camera duy
 6. Khởi động lại Home Assistant.
 
 ### Cách 2: Cài đặt thủ công (Manual)
-1. Tải file `tapo_local_ai_v2.0.1_fixed.zip` từ trang [Releases](https://www.google.com/search?q=https://github.com/hungng-21/Tapo_camera_local_ai/releases).
+1. Tải file `tapo_local_ai_v2.0.1_fixed.zip` từ trang [Releases](https://github.com/hungng-21/Tapo_camera_local_ai/releases).
 2. Giải nén file, sao chép toàn bộ thư mục `tapo_local_ai` vào đường dẫn `/config/custom_components/` của Home Assistant (đường dẫn đầy đủ: `/config/custom_components/tapo_local_ai/`).
 3. Khởi động lại Home Assistant.
 
@@ -211,25 +230,30 @@ action:
 
 ## ❓ Câu hỏi thường gặp (FAQ)
 
-&lt;details&gt;
-&lt;summary&gt;&lt;b&gt;1. Tôi cập nhật từ v2.0.0 lên v2.0.1 thì camera đang có sẵn có bị ảnh hưởng không?&lt;/b&gt;&lt;/summary&gt;
-Hoàn toàn &lt;b&gt;KHÔNG&lt;/b&gt;. Bản v2.0.1 tương thích ngược 100%. Tất cả Entity ID, tên gọi, các thẻ trên Dashboard và Automation bạn đã tạo từ trước đều được giữ nguyên vẹn.
-&lt;/details&gt;
+<details>
+<summary><b>1. Tôi cập nhật lên v2.1.0 thì camera đang có sẵn có bị ảnh hưởng không?</b></summary>
+Entity ID, tên gọi, các thẻ trên Dashboard và Automation bạn đã tạo đều được giữ nguyên. Thay đổi duy nhất về hành vi: khi camera mất liên lạc quá 60 giây, các entity chuyển sang <code>unavailable</code> thay vì giữ trạng thái cũ. Nếu automation của bạn kích hoạt khi một cảm biến chuyển từ <code>on</code> sang <code>off</code>, hãy kiểm tra lại trường hợp cảm biến chuyển sang <code>unavailable</code>.
+</details>
 
-&lt;details&gt;
-&lt;summary&gt;&lt;b&gt;2. Camera của tôi là C125 / C225 thì bấm nút bánh răng có bị hiện menu Face ID thừa không?&lt;/b&gt;&lt;/summary&gt;
-&lt;b&gt;KHÔNG&lt;/b&gt;. Bản v2.0.1 tự động phát hiện mã phần cứng camera. Với C125/C225, bấm nút bánh răng sẽ mở thẳng vào form chỉnh IP/kết nối; thanh bên Face Manager cũng tự động ẩn đi để giao diện Home Assistant luôn sạch sẽ.
-&lt;/details&gt;
+<details>
+<summary><b>2. Camera của tôi là C125 / C225 thì bấm nút bánh răng có bị hiện menu Face ID thừa không?</b></summary>
+<b>KHÔNG</b>. Bản v2.0.1 tự động phát hiện mã phần cứng camera. Với C125/C225, bấm nút bánh răng sẽ mở thẳng vào form chỉnh IP/kết nối; thanh bên Face Manager cũng tự động ẩn đi để giao diện Home Assistant luôn sạch sẽ.
+</details>
 
-&lt;details&gt;
-&lt;summary&gt;&lt;b&gt;3. Tại sao camera C125 trước đây bị mất kết nối 5 phút rồi tự có lại?&lt;/b&gt;&lt;/summary&gt;
-Đó là cơ chế bảo mật khóa IP 300 giây (mã lỗi &lt;code&gt;-40404&lt;/code&gt;) của firmware Tapo khi có nhiều lần thử mật khẩu sai liên tiếp. Bản v2.0.1 đã lưu cố định thông tin xác thực thành công và tắt luồng C260 thừa, chấm dứt hoàn toàn tình trạng này.
-&lt;/details&gt;
+<details>
+<summary><b>3. Camera thỉnh thoảng mất kết nối vài phút rồi tự có lại, do đâu?</b></summary>
+Xem thuộc tính <code>last_error</code> của sensor <i>Số lỗi quét liên tiếp (Polling Errors)</i>:
+<ul>
+<li><code>[Errno 113] Host is unreachable</code> / <code>ConnectionError</code>: camera thật sự biến mất khỏi mạng (rớt Wi-Fi, chuyển node mesh, mất nguồn hoặc tự khởi động lại). Integration không gây ra lỗi này. Hãy kiểm tra Wi-Fi/mesh và nguồn điện của camera.</li>
+<li><code>-40404</code> / <code>Temporary Suspension</code>: camera tạm khóa đăng nhập khoảng 5 phút vì có nhiều lần đăng nhập sai. Hãy kiểm tra lại tài khoản camera và mật khẩu cloud trong cấu hình.</li>
+</ul>
+Từ v2.1.0, thời gian mất kết nối hiển thị trên Home Assistant sát với thực tế hơn, vì poll dừng ngay ở request lỗi đầu tiên.
+</details>
 
 ---
 
 ## 🤝 Đóng góp & Bản quyền
 
-Dự án được phát triển và duy trì bởi [@hungng-21](https://www.google.com/search?q=https://github.com/hungng-21) cùng sự đóng góp giải pháp Nhận diện khuôn mặt từ [@quangtienhn](https://www.google.com/search?q=https://github.com/quangtienhn).
+Dự án được phát triển và duy trì bởi [@hungng-21](https://github.com/hungng-21) cùng sự đóng góp giải pháp Nhận diện khuôn mặt từ [@quangtienhn](https://github.com/quangtienhn).
 
 Phát hành theo giấy phép mã nguồn mở **MIT License**.

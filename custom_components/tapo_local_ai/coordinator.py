@@ -19,7 +19,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .api import TapoC260Api
@@ -98,6 +98,17 @@ CORE_PROTECTED_METHODS = frozenset(
     {"getLensMaskConfig", "getLedStatus", "getDetectionConfig"}
 )
 UNSUPPORTED_ERROR_CODES = frozenset({-40209, -40210, -40106, -10002})
+# AI/image settings rarely change; re-reading 15 sections every 6 s overloaded weak cameras (C125).
+CONFIG_SYNC_INTERVAL = 60.0
+PRIVACY_SYNC_INTERVAL = 15.0
+# After this long without a successful poll, entities turn unavailable instead of showing stale "off".
+UNAVAILABLE_AFTER = 60.0
+STORAGE_NOT_EXIST = "-71114"
+
+
+def _is_no_sd_card(err: Exception) -> bool:
+    """searchDetectionList fails with -71114 when no microSD card is present: camera is still reachable."""
+    return STORAGE_NOT_EXIST in str(err)
 
 
 def _clamp(value: Any, default: int, low: int, high: int) -> int:
@@ -415,6 +426,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._confirmed_supported_methods: set[str] = set()
         self._method_fail_counts: dict[str, int] = {}
         self._force_full_config_sync: bool = True
+        self._last_full_sync_ts: float = 0.0
+        self._last_privacy_read_ts: float = 0.0
 
         # Track active sensor state and last trigger timestamps
         self._last_triggered_ts: dict[str, float] = {
@@ -455,6 +468,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_attempt: datetime | None = None
         self._last_response_ms: int | None = None
         self._consecutive_failures: int = 0
+        self._down_since: float | None = None
         self._total_failures: int = 0
         self._last_error: str | None = None
         self._last_error_time: datetime | None = None
@@ -871,7 +885,11 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 if isinstance(events, list):
                     return events
+            except OSError:
+                raise
             except Exception as err:
+                if _is_no_sd_card(err):
+                    return []
                 _LOGGER.debug(
                     "getEvents() trên %s trả về lỗi (%s), thử searchDetectionList trực tiếp",
                     self.host,
@@ -904,7 +922,11 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     sample_ts = int(sample_ts / 1000)
                 if abs(now_ts - sample_ts) <= (window + 900):
                     return direct_events
+        except OSError:
+            raise
         except Exception as err:
+            if _is_no_sd_card(err):
+                return []
             _LOGGER.debug(
                 "searchDetectionList trực tiếp trên %s trả về lỗi (%s)",
                 self.host,
@@ -950,7 +972,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return results
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch latest local AI detection events and C260 Face Recognition events."""
+        """Fetch latest AI / Face events; raise UpdateFailed only after a sustained outage."""
         now_ts = time.time()
         self._last_attempt = dt_util.utcnow()
         fetch_started = time.monotonic()
@@ -988,6 +1010,14 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_response_ms = round((time.monotonic() - fetch_started) * 1000)
             self._last_success = dt_util.utcnow()
             self._consecutive_failures = 0
+            self._down_since = None
+        elif self._down_since is None:
+            self._down_since = time.monotonic()
+        elif time.monotonic() - self._down_since >= UNAVAILABLE_AFTER:
+            # Mark entities unavailable so automations don't trust stale "no detection" states.
+            raise UpdateFailed(
+                f"Camera {self.host} không phản hồi hơn {int(UNAVAILABLE_AFTER)}s: {self._last_error}"
+            )
 
         # 1. Process general AI detection events (Baby Cry, Bark, Meow, Glass Break, Person, Pet, Vehicle, Motion, etc.)
         for ev in events:
@@ -1621,6 +1651,18 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if changed:
             self.async_set_updated_data(self._build_state_snapshot(now_ts))
 
+    @callback
+    def _reset_onvif_states(self) -> None:
+        """Clear ONVIF 'active' flags: a dropped subscription never delivers the matching 'false'."""
+        if not any(self._onvif_active_state.values()):
+            return
+        for key in self._onvif_active_state:
+            self._onvif_active_state[key] = False
+        if self.data is not None:
+            # Not async_set_updated_data(): that would also flag the camera as reachable.
+            self.data = self._build_state_snapshot()
+            self.async_update_listeners()
+
     async def _async_onvif_pullpoint_loop(self) -> None:
         """Maintain a persistent local ONVIF PullPoint subscription on port 2020."""
         try:
@@ -1719,6 +1761,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except asyncio.TimeoutError:
                     pass
             finally:
+                self._reset_onvif_states()
                 if cam is not None:
                     try:
                         await cam.close()
@@ -1890,6 +1933,19 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Apply automatic alarm / siren settings (mode, volume, duration) to the camera."""
         tapo = self._ensure_tapo_sync()
         cur = dict(self._raw_sections.get(("msg_alarm", "chn1_msg_alarm_info"), {}))
+        if not cur:
+            # Unknown current config: read it first so 'enabled' is never written from a guess.
+            try:
+                res = tapo.executeFunction(
+                    "getLastAlarmInfo", {"msg_alarm": {"name": ["chn1_msg_alarm_info"]}}
+                )
+                if isinstance(res, dict):
+                    self._ingest_result_body(res)
+            except OSError:
+                raise
+            except Exception as err:
+                _LOGGER.debug("getLastAlarmInfo không khả dụng trên %s: %s", self.host, err)
+            cur = dict(self._raw_sections.get(("msg_alarm", "chn1_msg_alarm_info"), {}))
 
         en_bool = (
             enabled
@@ -2124,6 +2180,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
             try:
                 tapo.executeFunction(spec.set_method, payload)
+            except OSError:
+                raise
             except Exception:
                 tapo.executeFunction(
                     spec.set_method,
@@ -2146,6 +2204,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         fmt = self._sensitivity_format.get(spec.key, spec.default_format)
         primary_val = api_word if fmt == "word" else numeric_str
         fallback_val = numeric_str if fmt == "word" else api_word
+        sent_val = primary_val
 
         try:
             tapo.executeFunction(
@@ -2159,6 +2218,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     }
                 },
             )
+        except OSError:
+            raise
         except Exception:
             tapo.executeFunction(
                 spec.set_method,
@@ -2171,12 +2232,13 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     }
                 },
             )
+            sent_val = fallback_val
             self._sensitivity_format[spec.key] = (
                 "numeric" if fmt == "word" else "word"
             )
         sec = self._raw_sections.setdefault((spec.module, spec.section), {})
         sec["enabled"] = enabled_str
-        sec["sensitivity"] = primary_val
+        sec["sensitivity"] = sent_val
         self._force_full_config_sync = True
 
     async def async_set_sensitivity_10(
@@ -2227,13 +2289,16 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         do_full_sync = (
             self._force_full_config_sync
             or not self._switch_states
-            or (self._poll_counter % 2 == 1)
+            or (time.monotonic() - self._last_full_sync_ts) >= CONFIG_SYNC_INTERVAL
         )
 
         try:
             new_switches = self._read_switches_sync(full_sync=do_full_sync)
             if new_switches:
                 self._switch_states.update(new_switches)
+        except OSError:
+            # Camera unreachable: abort the whole poll instead of firing every remaining request.
+            raise
         except Exception as sw_err:
             err_str = str(sw_err).lower()
             if (
@@ -2282,6 +2347,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "true",
                         "1",
                     )
+        except OSError:
+            raise
         except Exception:
             pass
 
@@ -2296,6 +2363,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 elif isinstance(pm, bool):
                     is_privacy = pm
+            except OSError:
+                raise
             except Exception:
                 pass
 
@@ -2361,10 +2430,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "method": "getTamperDetectionConfig",
                     "params": {"tamper_detection": {"name": ["tamper_det"]}},
                 },
-                {
-                    "method": "getLensMaskConfig",
-                    "params": {"lens_mask": {"name": ["lens_mask_info"]}},
-                },
+                # getLensMaskConfig is read separately by _read_privacy_mode_sync.
                 {
                     "method": "getLedStatus",
                     "params": {"led": {"name": ["config"]}},
@@ -2567,8 +2633,17 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Read Privacy Mode on every cycle and full switches/sensitivities/audio on full_sync cycles."""
         tapo = self._ensure_tapo_sync()
 
-        # 1. Always read Privacy Mode (getLensMaskConfig) first
-        is_privacy = self._read_privacy_mode_sync(tapo)
+        # 1. Read Privacy Mode (getLensMaskConfig) on full syncs and at most every PRIVACY_SYNC_INTERVAL
+        now = time.monotonic()
+        if (
+            full_sync
+            or self._force_full_config_sync
+            or (now - self._last_privacy_read_ts) >= PRIVACY_SYNC_INTERVAL
+        ):
+            is_privacy = self._read_privacy_mode_sync(tapo)
+            self._last_privacy_read_ts = now
+        else:
+            is_privacy = self._switch_states.get("privacy_mode_switch")
 
         # If Privacy Mode is ON (physical shutter closed on C125/C225) or this is a lightweight fast-sync cycle,
         # return updated states immediately without hammering disabled AI/image modules.
@@ -2612,6 +2687,9 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             self._ingest_result_body(res_body)
                 else:
                     failed_methods.extend(chunk)
+            except OSError:
+                # Network failure, not an unsupported method: retrying each one would only add load.
+                raise
             except Exception:
                 failed_methods.extend(chunk)
 
@@ -2625,6 +2703,8 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if isinstance(res, dict):
                     self._record_method_outcome(m_name, 0, False)
                     self._ingest_result_body(res)
+            except OSError:
+                raise
             except Exception as single_err:
                 err_s = str(single_err)
                 for code in UNSUPPORTED_ERROR_CODES:
@@ -2633,6 +2713,7 @@ class TapoLocalAICoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         break
 
         self._force_full_config_sync = False
+        self._last_full_sync_ts = time.monotonic()
         return self._extract_states_from_raw_sections()
 
     async def async_refresh_switches(self) -> None:
