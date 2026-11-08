@@ -185,6 +185,7 @@ async def _merge_history(
 
 
 @websocket_api.websocket_command({vol.Required("type"): WS_GET_DATA})
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_get_data(
     hass: HomeAssistant,
@@ -211,6 +212,7 @@ async def websocket_get_data(
         vol.Optional("old_face_id"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_save_face(
     hass: HomeAssistant,
@@ -258,6 +260,7 @@ async def websocket_save_face(
         vol.Required("face_id"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_delete_face(
     hass: HomeAssistant,
@@ -290,6 +293,7 @@ async def websocket_delete_face(
         vol.Required("face_id"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_forget_unknown(
     hass: HomeAssistant,
@@ -316,6 +320,7 @@ async def websocket_forget_unknown(
         vol.Required("entry_id"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_clear_unknown(
     hass: HomeAssistant,
@@ -345,6 +350,7 @@ async def websocket_clear_unknown(
         ),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_get_stats(
     hass: HomeAssistant,
@@ -375,6 +381,7 @@ async def websocket_get_stats(
         vol.Optional("date"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_get_day(
     hass: HomeAssistant,
@@ -428,6 +435,7 @@ async def websocket_get_day(
         ),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def websocket_save_settings(
     hass: HomeAssistant,
